@@ -14,7 +14,7 @@ Raw ticks never leave this layer — everything above consumes `MarketSnapshot` 
 
 ## Data source
 Ships with a Binance USD-M Futures WebSocket collector for dev/testing. The production
-EVEDEX feed lives in [`kairos-execution-engine`](https://github.com/TheLitis/kairos-execution-engine)
+EVEDEX feed lives in [`kairos-execution-engine`](https://github.com/Kairos-cryptoAI/kairos-execution-engine)
 and is injected through the same `SnapshotBuilder`.
 
 ## Run
@@ -26,4 +26,4 @@ python -m kairos_quant
 Emits `kairos.market.snapshot`.
 
 ---
-Part of the [Kairos](https://github.com/TheLitis/kairos) system. MIT licensed.
+Part of the [Kairos](https://github.com/Kairos-cryptoAI/kairos) system. MIT licensed.
