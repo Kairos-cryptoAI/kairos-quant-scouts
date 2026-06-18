@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kairos-quant-scouts"
+version = "0.1.0"
+description = "Kairos Layer 1A — pure-math market data collectors and indicators."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [{ name = "TheLitis" }]
+dependencies = [
+    "kairos-core>=0.1.0",
+    "numpy>=1.26",
+    "aiohttp>=3.9",
+    "redis>=5.0",
+    "structlog>=24.1",
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2"
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.4", "mypy>=1.10"]
+
+[project.scripts]
+kairos-quant-scouts = "kairos_quant.service:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["kairos_quant"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
