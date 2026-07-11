@@ -29,7 +29,9 @@ class QuantScoutsService:
             await asyncio.sleep(self.settings.snapshot_interval_s)
             for sym in self.settings.symbols:
                 book = self.collector.books.get(sym.lower(), {"bids": [], "asks": []})
-                if not book["bids"]:
+                # Binance depth updates can temporarily expose only one side while
+                # reconnecting/resynchronising. Never index or publish an incomplete book.
+                if not book["bids"] or not book["asks"]:
                     continue
                 mid = (book["bids"][0][0] + book["asks"][0][0]) / 2.0
                 self.builder.push_close(sym.upper(), mid)
