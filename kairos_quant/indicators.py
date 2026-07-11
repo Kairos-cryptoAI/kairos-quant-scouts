@@ -48,7 +48,9 @@ def rsi(values: Sequence[float], period: int = 14) -> float:
     return float(100.0 - 100.0 / (1.0 + rs))
 
 
-def macd(values: Sequence[float], fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[float, float, float]:
+def macd(
+    values: Sequence[float], fast: int = 12, slow: int = 26, signal: int = 9
+) -> Tuple[float, float, float]:
     """Return the latest ``(macd, signal, histogram)`` triple."""
     arr = np.asarray(values, dtype=float)
     if arr.size < slow:

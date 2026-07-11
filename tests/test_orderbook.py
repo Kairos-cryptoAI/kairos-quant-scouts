@@ -5,7 +5,7 @@ def test_imbalance_sign():
     bids = [(100, 5)] * 10
     asks = [(101, 1)] * 10
     assert order_book_imbalance(bids, asks, 10) > 0
-    assert order_book_imbalance(asks_to_bids := [(100, 1)] * 10, [(101, 5)] * 10, 10) < 0
+    assert order_book_imbalance([(100, 1)] * 10, [(101, 5)] * 10, 10) < 0
 
 
 def test_spread_bps():
