@@ -42,7 +42,7 @@ jobs:
       - name: Check formatting
         run: uv run --locked ruff format --check kairos_quant tests
       - name: Type check
-        run: uv run --locked mypy kairos_quant
+        run: uv run --locked mypy --python-version ${{ matrix.python-version }} kairos_quant
       - name: Security scan
         run: uv run --locked bandit -q -r kairos_quant -x tests
       - name: Test
