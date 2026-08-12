@@ -1,11 +1,22 @@
-.PHONY: install lint test format run
+UV ?= uv
+
+.PHONY: install lint format format-check typecheck security test build run all
 install:
-	pip install -e ".[dev]"
+	$(UV) sync --locked
 format:
-	ruff format kairos_quant tests
+	$(UV) run --locked ruff format kairos_quant tests
+format-check:
+	$(UV) run --locked ruff format --check kairos_quant tests
 lint:
-	ruff check kairos_quant tests
+	$(UV) run --locked ruff check kairos_quant tests
+typecheck:
+	$(UV) run --locked mypy kairos_quant
+security:
+	$(UV) run --locked bandit -q -r kairos_quant -x tests
 test:
-	pytest -q
+	$(UV) run --locked pytest -q --tb=short
+build:
+	$(UV) build --no-sources
 run:
-	python -m kairos_quant
+	$(UV) run --locked python -m kairos_quant
+all: lint format-check typecheck security test build
