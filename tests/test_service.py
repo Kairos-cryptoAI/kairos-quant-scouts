@@ -41,13 +41,18 @@ def _service() -> QuantScoutsService:
     )
     service = QuantScoutsService(settings)
     service.bus = _RecordingBus()
+    service.collector._clock = lambda: 100.0
+    service.collector._wall_clock = lambda: 60.0
+    service.collector._on_message({"stream": "btcusdt@markPrice@1s", "data": {"E": 60_000, "r": "0.0001"}})
+    service.collector.open_interest["btcusdt"] = 1_000.0
+    service.collector._open_interest_updated_at["btcusdt"] = 100.0
     return service
 
 
-def _depth_message(*, bid: str = "100", ask: str = "102") -> dict:
+def _depth_message(*, bid: str = "100", ask: str = "102", event_time_ms: int = 60_000) -> dict:
     return {
         "stream": "btcusdt@depth10@100ms",
-        "data": {"b": [[bid, "2"]], "a": [[ask, "3"]]},
+        "data": {"E": event_time_ms, "u": 1, "b": [[bid, "2"]], "a": [[ask, "3"]]},
     }
 
 
@@ -64,7 +69,7 @@ def _kline_message(
         "data": {
             "k": {
                 "x": closed,
-                "T": 60_000,
+                "T": 59_999,
                 "h": high,
                 "l": low,
                 "c": close,
@@ -116,7 +121,7 @@ def test_emit_uses_closed_kline_for_indicators_and_current_book_for_mid_price():
     assert snapshot.volume_usd == 3000.0
     assert snapshot.derivatives.open_interest == 12345.0
     assert snapshot.derivatives.oi_change_pct_1h == 2.5
-    assert snapshot.indicators.atr_pct is not None
+    assert snapshot.indicators.atr_pct is None
     assert snapshot.derivatives.long_liquidations_usd == 200.0
     assert snapshot.derivatives.short_liquidations_usd == 0.0
 
@@ -133,6 +138,62 @@ def test_emit_rejects_stale_book_without_losing_closed_kline():
 
     assert service.bus.messages == []
     assert list(service.builder._closes["BTCUSDT"]) == [95.0]
+
+
+def test_emit_rejects_stale_derivatives_even_with_fresh_book_and_kline():
+    now = [281.0]
+    service = _service()
+    service.collector._clock = lambda: now[0]
+    service.collector._wall_clock = lambda: 180.0
+    service.collector._on_message(_depth_message(event_time_ms=180_000))
+    service.collector._on_message(
+        {
+            "stream": "btcusdt@kline_1m",
+            "data": {
+                "k": {
+                    "x": True,
+                    "T": 179_999,
+                    "h": "101",
+                    "l": "99",
+                    "c": "100",
+                    "q": "1000",
+                }
+            },
+        }
+    )
+
+    asyncio.run(service._emit_once())
+
+    assert service.bus.messages == []
+
+
+def test_emit_resumes_after_derivative_observations_are_refreshed():
+    now = [281.0]
+    service = _service()
+    service.collector._clock = lambda: now[0]
+    service.collector._wall_clock = lambda: 180.0
+    service.collector._on_message(_depth_message(event_time_ms=180_000))
+    service.collector._on_message(
+        {
+            "stream": "btcusdt@kline_1m",
+            "data": {
+                "k": {
+                    "x": True,
+                    "T": 179_999,
+                    "h": "101",
+                    "l": "99",
+                    "c": "100",
+                    "q": "1000",
+                }
+            },
+        }
+    )
+    service.collector._on_message({"stream": "btcusdt@markPrice@1s", "data": {"E": 180_000, "r": "0.0002"}})
+    service.collector._open_interest_updated_at["btcusdt"] = now[0]
+
+    asyncio.run(service._emit_once())
+
+    assert len(service.bus.messages) == 1
 
 
 def test_emit_keeps_liquidations_when_publish_fails():

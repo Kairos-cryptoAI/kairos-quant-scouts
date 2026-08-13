@@ -14,6 +14,8 @@ from .snapshot import SnapshotBuilder
 
 log = get_logger("quant-scouts")
 
+_ONE_MINUTE_MS = 60_000
+
 
 class QuantScoutsService:
     def __init__(self, settings: QuantSettings | None = None) -> None:
@@ -28,7 +30,9 @@ class QuantScoutsService:
             self.settings.binance_rest_base,
             reconnect_initial_s=self.settings.ws_reconnect_initial_s,
             reconnect_max_s=self.settings.ws_reconnect_max_s,
+            kline_buffer_size=self.settings.price_window,
         )
+        self._last_kline_close_time_ms: dict[str, int] = {}
 
     async def _emit_loop(self) -> None:
         while True:
@@ -43,7 +47,14 @@ class QuantScoutsService:
             # Drain every closed candle exactly once, even if the book is temporarily
             # unavailable. Live mid-prices must never enter the indicator history.
             for kline in self.collector.drain_closed_klines(key):
+                previous_close_time_ms = self._last_kline_close_time_ms.get(key)
+                if (
+                    previous_close_time_ms is not None
+                    and kline.close_time_ms - previous_close_time_ms != _ONE_MINUTE_MS
+                ):
+                    self.builder.reset(symbol)
                 self.builder.push_candle(symbol, high=kline.high, low=kline.low, close=kline.close)
+                self._last_kline_close_time_ms[key] = kline.close_time_ms
 
             book = self.collector.books.get(key, {"bids": [], "asks": []})
             if (
@@ -51,6 +62,11 @@ class QuantScoutsService:
                 or not book["asks"]
                 or not self.collector.is_book_fresh(key, self.settings.book_stale_after_s)
                 or not self.collector.is_kline_fresh(key, self.settings.kline_stale_after_s)
+                or not self.collector.is_funding_fresh(key, self.settings.derivatives_stale_after_s)
+                or not self.collector.is_open_interest_fresh(
+                    key,
+                    self.settings.derivatives_stale_after_s,
+                )
             ):
                 log.warning("snapshot.skipped_stale", symbol=symbol)
                 continue

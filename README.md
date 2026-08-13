@@ -9,12 +9,14 @@ compact `MarketSnapshot` — the only numeric payload the upper layers consume.
 - **Order book:** top-N imbalance, spread in basis points, and resting depth.
 - **Derivatives:** funding rate, USD open-interest value, one-hour OI delta, and
   interval long/short liquidations.
-- **Indicators:** Wilder's RSI(14), MACD(12,26,9), and ATR as a fraction of price.
+- **Indicators:** Wilder's RSI(14), fully warmed MACD(12,26,9), and Wilder-smoothed
+  ATR as a fraction of the last closed-candle price.
 - **Quant bias:** a transparent LONG/SHORT/FLAT vote from momentum, MACD, and book pressure.
 
 Raw ticks never leave this layer. RSI and MACD history is populated exclusively from
 closed Binance one-minute klines; the current order book is used only for live price,
-spread, depth, and imbalance.
+spread, depth, and imbalance. Recursive EMA/Wilder state persists when the bounded raw
+candle window evicts old rows, so live values remain consistent with an unbounded replay.
 
 ## Data source
 
@@ -29,6 +31,11 @@ Open interest value and its one-hour change are refreshed periodically from Bina
 5-minute statistics. Closed candles are backfilled over REST on startup and reconnect,
 then deduplicated against the WebSocket stream. Connections use bounded exponential
 backoff, and snapshots are suppressed when their book or last closed kline is stale.
+Funding and open interest must also have fresh successful observations; the OI series
+must be a contiguous 13-point five-minute grid and its last source point cannot be stale. Kline freshness
+checks both receipt time and the exchange close timestamp, so a newly received historical
+backfill cannot masquerade as current data. A gap in the one-minute candle sequence resets
+indicator history instead of blending unequal time intervals.
 Liquidation totals are removed only after their snapshot is published successfully.
 The production EVEDEX feed lives in
 [`kairos-execution-engine`](https://github.com/Kairos-cryptoAI/kairos-execution-engine)
