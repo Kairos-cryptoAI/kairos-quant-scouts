@@ -1,4 +1,5 @@
 """Quant Scouts service: collector -> SnapshotBuilder -> bus."""
+
 from __future__ import annotations
 
 import asyncio
@@ -18,37 +19,72 @@ class QuantScoutsService:
     def __init__(self, settings: QuantSettings | None = None) -> None:
         self.settings = settings or QuantSettings()
         self.bus = build_bus(self.settings)
-        self.builder = SnapshotBuilder(self.settings.service_name, self.settings.price_window,
-                                       self.settings.depth_levels)
+        self.builder = SnapshotBuilder(
+            self.settings.service_name, self.settings.price_window, self.settings.depth_levels
+        )
         self.collector = BinanceFuturesCollector(
-            self.settings.symbols, self.settings.binance_ws_base, self.settings.binance_rest_base
+            self.settings.symbols,
+            self.settings.binance_ws_base,
+            self.settings.binance_rest_base,
+            reconnect_initial_s=self.settings.ws_reconnect_initial_s,
+            reconnect_max_s=self.settings.ws_reconnect_max_s,
         )
 
     async def _emit_loop(self) -> None:
         while True:
             await asyncio.sleep(self.settings.snapshot_interval_s)
-            for sym in self.settings.symbols:
-                book = self.collector.books.get(sym.lower(), {"bids": [], "asks": []})
-                # Binance depth updates can temporarily expose only one side while
-                # reconnecting/resynchronising. Never index or publish an incomplete book.
-                if not book["bids"] or not book["asks"]:
-                    continue
-                mid = (book["bids"][0][0] + book["asks"][0][0]) / 2.0
-                self.builder.push_close(sym.upper(), mid)
-                snap = self.builder.build(
-                    sym.upper(), bids=book["bids"], asks=book["asks"],
-                    funding_rate=self.collector.funding.get(sym.lower(), 0.0),
-                    open_interest=self.collector.open_interest.get(sym.lower(), 0.0),
-                )
-                await self.bus.publish(Topics.MARKET_SNAPSHOT, snap)
-                log.info("snapshot", symbol=snap.symbol, bias=snap.quant_bias.value,
-                        rsi=round(snap.indicators.rsi_14, 1))
+            await self._emit_once()
+
+    async def _emit_once(self) -> None:
+        for configured_symbol in self.settings.symbols:
+            symbol = configured_symbol.upper()
+            key = configured_symbol.lower()
+
+            # Drain every closed candle exactly once, even if the book is temporarily
+            # unavailable. Live mid-prices must never enter the indicator history.
+            for kline in self.collector.drain_closed_klines(key):
+                self.builder.push_candle(symbol, high=kline.high, low=kline.low, close=kline.close)
+
+            book = self.collector.books.get(key, {"bids": [], "asks": []})
+            if (
+                not book["bids"]
+                or not book["asks"]
+                or not self.collector.is_book_fresh(key, self.settings.book_stale_after_s)
+                or not self.collector.is_kline_fresh(key, self.settings.kline_stale_after_s)
+            ):
+                log.warning("snapshot.skipped_stale", symbol=symbol)
+                continue
+
+            liquidations = self.collector.liquidation_totals(key)
+            snapshot = self.builder.build(
+                symbol,
+                bids=book["bids"],
+                asks=book["asks"],
+                funding_rate=self.collector.funding.get(key, 0.0),
+                open_interest=self.collector.open_interest.get(key, 0.0),
+                oi_change_pct_1h=self.collector.oi_change_pct_1h.get(key, 0.0),
+                long_liq_usd=liquidations.long_usd,
+                short_liq_usd=liquidations.short_usd,
+                volume_usd=self.collector.volume_usd.get(key, 0.0),
+            )
+            await self.bus.publish(Topics.MARKET_SNAPSHOT, snapshot)
+            self.collector.acknowledge_liquidations(key, liquidations)
+            log.info(
+                "snapshot",
+                symbol=snapshot.symbol,
+                bias=snapshot.quant_bias.value,
+                rsi=round(snapshot.indicators.rsi_14, 1),
+            )
 
     async def run(self) -> None:  # pragma: no cover - requires network
-        configure_logging(self.settings.log_level, json_logs=self.settings.log_json,
-                          service=self.settings.service_name)
+        configure_logging(
+            self.settings.log_level, json_logs=self.settings.log_json, service=self.settings.service_name
+        )
         log.info("quant.start", symbols=self.settings.symbols)
-        await asyncio.gather(self.collector.run(), self._emit_loop())
+        async with asyncio.TaskGroup() as tasks:
+            tasks.create_task(self.collector.run())
+            tasks.create_task(self.collector.run_open_interest_loop(self.settings.open_interest_interval_s))
+            tasks.create_task(self._emit_loop())
 
 
 def main() -> None:  # pragma: no cover

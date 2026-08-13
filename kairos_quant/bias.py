@@ -1,11 +1,19 @@
 """Derive a pure-math directional bias from indicators + book pressure."""
+
 from __future__ import annotations
 
 from kairos_core.enums import Side
 
 
-def derive_bias(*, rsi_14: float, macd_hist: float, ob_imbalance: float,
-                rsi_high: float = 55.0, rsi_low: float = 45.0, imb_thr: float = 0.15) -> Side:
+def derive_bias(
+    *,
+    rsi_14: float,
+    macd_hist: float,
+    ob_imbalance: float,
+    rsi_high: float = 55.0,
+    rsi_low: float = 45.0,
+    imb_thr: float = 0.15,
+) -> Side:
     """Simple, transparent rule combining momentum, MACD and book pressure.
 
     LONG  when momentum and MACD both lean up (and the book is not against us);

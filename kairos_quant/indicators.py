@@ -3,14 +3,15 @@
 Implemented on plain sequences (numpy under the hood) so they are easy to unit
 test against known properties and reference values.
 """
+
 from __future__ import annotations
 
-from typing import Sequence, Tuple
+from collections.abc import Sequence
 
 import numpy as np
 
 
-def ema(values: Sequence[float], period: int) -> np.ndarray:
+def ema(values: Sequence[float] | np.ndarray, period: int) -> np.ndarray:
     """Exponential moving average, seeded with the SMA of the first ``period``."""
     arr = np.asarray(values, dtype=float)
     if arr.size == 0:
@@ -42,6 +43,8 @@ def rsi(values: Sequence[float], period: int = 14) -> float:
     for i in range(period, deltas.size):
         avg_gain = (avg_gain * (period - 1) + gains[i]) / period
         avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    if avg_gain == 0 and avg_loss == 0:
+        return 50.0
     if avg_loss == 0:
         return 100.0
     rs = avg_gain / avg_loss
@@ -50,7 +53,7 @@ def rsi(values: Sequence[float], period: int = 14) -> float:
 
 def macd(
     values: Sequence[float], fast: int = 12, slow: int = 26, signal: int = 9
-) -> Tuple[float, float, float]:
+) -> tuple[float, float, float]:
     """Return the latest ``(macd, signal, histogram)`` triple."""
     arr = np.asarray(values, dtype=float)
     if arr.size < slow:

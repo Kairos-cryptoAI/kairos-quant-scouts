@@ -1,10 +1,11 @@
 import numpy as np
-from kairos_quant.indicators import ema, rsi, macd, atr
+
+from kairos_quant.indicators import atr, ema, macd, rsi
 
 
 def test_rsi_bounds_and_extremes():
-    up = list(range(1, 60))           # strictly increasing -> RSI ~ 100
-    down = list(range(60, 1, -1))     # strictly decreasing -> RSI ~ 0
+    up = list(range(1, 60))  # strictly increasing -> RSI ~ 100
+    down = list(range(60, 1, -1))  # strictly decreasing -> RSI ~ 0
     assert rsi(up, 14) > 99.0
     assert rsi(down, 14) < 1.0
     assert 0.0 <= rsi([1, 2, 1, 2, 1, 2] * 5, 14) <= 100.0
@@ -12,6 +13,10 @@ def test_rsi_bounds_and_extremes():
 
 def test_rsi_short_series_neutral():
     assert rsi([1, 2, 3], 14) == 50.0
+
+
+def test_rsi_flat_series_is_neutral():
+    assert rsi([42.0] * 50, 14) == 50.0
 
 
 def test_macd_sign_follows_trend():

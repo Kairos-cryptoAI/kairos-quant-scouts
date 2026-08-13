@@ -1,4 +1,5 @@
 from kairos_core.enums import Side
+
 from kairos_quant.bias import derive_bias
 
 

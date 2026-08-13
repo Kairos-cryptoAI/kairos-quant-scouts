@@ -1,4 +1,4 @@
-from kairos_quant.orderbook import order_book_imbalance, spread_bps, depth_usd
+from kairos_quant.orderbook import depth_usd, order_book_imbalance, spread_bps
 
 
 def test_imbalance_sign():
