@@ -71,6 +71,13 @@ uv build --no-sources
 
 CI covers Linux on Python 3.11 and 3.14 plus Windows on Python 3.11.
 
+## Runtime delivery durability
+
+The Redis backend uses `kairos-persistence`: publications are committed to a
+PostgreSQL outbox before dispatch. Configure `KAIROS_PERSISTENCE_DATABASE_URL`
+through the deployment secret provider. The in-memory backend intentionally
+bypasses persistence and is limited to local tests.
+
 ---
 
 Part of the [Kairos](https://github.com/Kairos-cryptoAI/kairos) system. MIT licensed.

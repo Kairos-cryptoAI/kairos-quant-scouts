@@ -7,6 +7,7 @@ import asyncio
 from kairos_core.bus import build_bus
 from kairos_core.logging import configure_logging, get_logger
 from kairos_core.topics import Topics
+from kairos_persistence import DurableMessageBus
 
 from .collectors import BinanceFuturesCollector
 from .config import QuantSettings
@@ -20,7 +21,12 @@ _ONE_MINUTE_MS = 60_000
 class QuantScoutsService:
     def __init__(self, settings: QuantSettings | None = None) -> None:
         self.settings = settings or QuantSettings()
-        self.bus = build_bus(self.settings)
+        transport = build_bus(self.settings)
+        self.bus = (
+            transport
+            if self.settings.bus_backend == "memory"
+            else DurableMessageBus(transport, service_name=self.settings.service_name)
+        )
         self.builder = SnapshotBuilder(
             self.settings.service_name, self.settings.price_window, self.settings.depth_levels
         )
