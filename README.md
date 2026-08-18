@@ -41,6 +41,28 @@ The production EVEDEX feed lives in
 [`kairos-execution-engine`](https://github.com/Kairos-cryptoAI/kairos-execution-engine)
 and is injected through the same `SnapshotBuilder` contract.
 
+## Venue comparison
+
+Binance remains a research/data proxy, not proof of EVEDEX execution quality. Run the
+public, order-free comparison before any shadow or canary phase:
+
+```powershell
+uv run --locked kairos-venue-compare `
+  --samples 30 `
+  --interval-s 2 `
+  --notional-usd 1000 `
+  --output $env:TEMP\kairos-venue-comparison.json `
+  --overwrite
+```
+
+Each synchronized observation records both venue timestamps, basis, spread, request
+latency, and executable buy/sell slippage from up to 100 book levels. The blocking gate
+requires 30/30 observations per symbol, at least 99% availability, fresh books with no
+more than two seconds of timestamp skew, p95 absolute basis/spread/slippage below the
+registered limits, and sufficient EVEDEX depth for the requested notional. Reports
+always set `live_orders_allowed=false`: a short PASS qualifies only that observation
+window and not future liquidity, order placement, fills, or custody.
+
 ## Local development
 
 Install [uv](https://docs.astral.sh/uv/) once. The repository pins uv 0.12.3,

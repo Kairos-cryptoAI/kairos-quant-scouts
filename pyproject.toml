@@ -36,6 +36,7 @@ kairos-persistence = { git = "https://github.com/Kairos-cryptoAI/kairos-persiste
 
 [project.scripts]
 kairos-quant-scouts = "kairos_quant.service:main"
+kairos-venue-compare = "kairos_quant.venue_comparison:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["kairos_quant"]
