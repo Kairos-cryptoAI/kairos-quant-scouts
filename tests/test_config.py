@@ -21,3 +21,12 @@ from kairos_quant.indicators import MACD_MIN_SAMPLES
 def test_math_and_freshness_boundaries_are_validated_at_configuration(override):
     with pytest.raises(ValidationError):
         QuantSettings(**override)
+
+
+def test_enabled_runtime_gate_rejects_non_dev_evedex_url():
+    with pytest.raises(ValidationError, match="exact official EVEDEX DEV URL"):
+        QuantSettings(
+            bus_backend="memory",
+            enable_venue_quality_gate=True,
+            evedex_dev_base_url="https://trading-api.evedex.com",
+        )

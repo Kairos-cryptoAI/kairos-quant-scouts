@@ -2,6 +2,9 @@
 
 import asyncio
 
+from kairos_core.contracts import ClosedBarEventV1
+from kairos_core.topics import Topics
+
 from kairos_quant.config import QuantSettings
 from kairos_quant.service import QuantScoutsService
 
@@ -59,6 +62,7 @@ def _depth_message(*, bid: str = "100", ask: str = "102", event_time_ms: int = 6
 def _kline_message(
     *,
     closed: bool,
+    close_time_ms: int = 59_999,
     close: str = "95",
     high: str = "100",
     low: str = "90",
@@ -69,11 +73,16 @@ def _kline_message(
         "data": {
             "k": {
                 "x": closed,
-                "T": 59_999,
+                "t": close_time_ms - 59_999,
+                "T": close_time_ms,
+                "o": close,
                 "h": high,
                 "l": low,
                 "c": close,
+                "v": "25",
                 "q": quote_volume,
+                "V": "10",
+                "Q": str(float(quote_volume) * 0.4),
             }
         },
     }
@@ -86,7 +95,10 @@ def test_emit_skips_incomplete_order_book():
 
     asyncio.run(service._emit_once())
 
-    assert service.bus.messages == []
+    assert len(service.bus.messages) == 1
+    topic, bar = service.bus.messages[0]
+    assert topic == Topics.CLOSED_BAR
+    assert isinstance(bar, ClosedBarEventV1)
 
 
 def test_emit_requires_a_closed_kline():
@@ -97,6 +109,36 @@ def test_emit_requires_a_closed_kline():
     asyncio.run(service._emit_once())
 
     assert service.bus.messages == []
+
+
+def test_emit_blocks_entire_symbol_until_gap_is_backfilled():
+    service = _service()
+    service.collector._wall_clock = lambda: 180.0
+    service.collector._on_message(_kline_message(closed=True, close_time_ms=59_999, close="95"))
+    service.collector._on_message(_kline_message(closed=True, close_time_ms=179_999, close="97"))
+
+    asyncio.run(service._emit_once())
+
+    assert service.bus.messages == []
+    assert len(service.collector.pending_closed_klines("btcusdt")) == 1
+
+    service.collector._on_message(_kline_message(closed=True, close_time_ms=119_999, close="96"))
+    asyncio.run(service._emit_once())
+
+    assert [topic for topic, _ in service.bus.messages] == [Topics.CLOSED_BAR] * 3
+    assert [message.close_time_ms for _, message in service.bus.messages] == [59_999, 119_999, 179_999]
+
+
+def test_emit_blocks_conflicting_final_bar():
+    service = _service()
+    service.collector._wall_clock = lambda: 120.0
+    service.collector._on_message(_kline_message(closed=True, close="95"))
+    service.collector._on_message(_kline_message(closed=True, close="96"))
+
+    asyncio.run(service._emit_once())
+
+    assert service.bus.messages == []
+    assert service.collector.kline_integrity_reason("btcusdt") == "conflicting_closed_bar"
 
 
 def test_emit_uses_closed_kline_for_indicators_and_current_book_for_mid_price():
@@ -115,8 +157,14 @@ def test_emit_uses_closed_kline_for_indicators_and_current_book_for_mid_price():
     asyncio.run(service._emit_once())
 
     assert list(service.builder._closes["BTCUSDT"]) == [95.0]
-    assert len(service.bus.messages) == 1
-    snapshot = service.bus.messages[0][1]
+    assert [topic for topic, _ in service.bus.messages] == [Topics.CLOSED_BAR, Topics.MARKET_SNAPSHOT]
+    bar = service.bus.messages[0][1]
+    assert isinstance(bar, ClosedBarEventV1)
+    assert bar.open == 95.0
+    assert bar.base_volume == 25.0
+    assert bar.taker_buy_base_volume == 10.0
+    assert bar.bar_sha256 == bar.message_id
+    snapshot = service.bus.messages[1][1]
     assert snapshot.mid_price == 101.0
     assert snapshot.volume_usd == 3000.0
     assert snapshot.derivatives.open_interest == 12345.0
@@ -136,7 +184,7 @@ def test_emit_rejects_stale_book_without_losing_closed_kline():
 
     asyncio.run(service._emit_once())
 
-    assert service.bus.messages == []
+    assert [topic for topic, _ in service.bus.messages] == [Topics.CLOSED_BAR]
     assert list(service.builder._closes["BTCUSDT"]) == [95.0]
 
 
@@ -152,11 +200,16 @@ def test_emit_rejects_stale_derivatives_even_with_fresh_book_and_kline():
             "data": {
                 "k": {
                     "x": True,
+                    "t": 120_000,
                     "T": 179_999,
+                    "o": "100",
                     "h": "101",
                     "l": "99",
                     "c": "100",
+                    "v": "10",
                     "q": "1000",
+                    "V": "5",
+                    "Q": "500",
                 }
             },
         }
@@ -164,7 +217,7 @@ def test_emit_rejects_stale_derivatives_even_with_fresh_book_and_kline():
 
     asyncio.run(service._emit_once())
 
-    assert service.bus.messages == []
+    assert [topic for topic, _ in service.bus.messages] == [Topics.CLOSED_BAR]
 
 
 def test_emit_resumes_after_derivative_observations_are_refreshed():
@@ -179,11 +232,16 @@ def test_emit_resumes_after_derivative_observations_are_refreshed():
             "data": {
                 "k": {
                     "x": True,
+                    "t": 120_000,
                     "T": 179_999,
+                    "o": "100",
                     "h": "101",
                     "l": "99",
                     "c": "100",
+                    "v": "10",
                     "q": "1000",
+                    "V": "5",
+                    "Q": "500",
                 }
             },
         }
@@ -193,7 +251,7 @@ def test_emit_resumes_after_derivative_observations_are_refreshed():
 
     asyncio.run(service._emit_once())
 
-    assert len(service.bus.messages) == 1
+    assert [topic for topic, _ in service.bus.messages] == [Topics.CLOSED_BAR, Topics.MARKET_SNAPSHOT]
 
 
 def test_emit_keeps_liquidations_when_publish_fails():
@@ -216,6 +274,7 @@ def test_emit_keeps_liquidations_when_publish_fails():
         raise AssertionError("publish failure was not propagated")
 
     assert service.collector.liquidation_totals("btcusdt").long_usd == 200.0
+    assert [item.close_time_ms for item in service.collector.pending_closed_klines("btcusdt")] == [59_999]
 
 
 def test_emit_does_not_clear_liquidations_arriving_during_publish():

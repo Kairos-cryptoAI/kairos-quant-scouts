@@ -4,13 +4,20 @@ from __future__ import annotations
 
 import asyncio
 
+import aiohttp
 from kairos_core.bus import build_bus
+from kairos_core.contracts import ClosedBarEventV1
 from kairos_core.logging import configure_logging, get_logger
 from kairos_core.topics import Topics
 from kairos_persistence import DurableMessageBus
 
 from .collectors import BinanceFuturesCollector
 from .config import QuantSettings
+from .runtime_venue_gate import (
+    VenueGatePolicy,
+    evedex_dev_symbol,
+    fetch_venue_quality,
+)
 from .snapshot import SnapshotBuilder
 
 log = get_logger("quant-scouts")
@@ -39,6 +46,17 @@ class QuantScoutsService:
             kline_buffer_size=self.settings.price_window,
         )
         self._last_kline_close_time_ms: dict[str, int] = {}
+        self.venue_gate_policy = VenueGatePolicy(
+            assessed_notional_usd=self.settings.venue_quality_notional_usd,
+            maximum_abs_basis_bps=self.settings.maximum_abs_basis_bps,
+            maximum_spread_bps=self.settings.maximum_evedex_spread_bps,
+            maximum_slippage_bps=self.settings.maximum_evedex_slippage_bps,
+            maximum_book_age_ms=self.settings.maximum_venue_book_age_ms,
+            maximum_timestamp_skew_ms=self.settings.maximum_venue_timestamp_skew_ms,
+            maximum_latency_ms=self.settings.maximum_venue_latency_ms,
+            measurement_ttl_ms=self.settings.venue_quality_ttl_ms,
+            taker_fee_bps=self.settings.venue_taker_fee_bps,
+        )
 
     async def _emit_loop(self) -> None:
         while True:
@@ -50,10 +68,42 @@ class QuantScoutsService:
             symbol = configured_symbol.upper()
             key = configured_symbol.lower()
 
-            # Drain every closed candle exactly once, even if the book is temporarily
-            # unavailable. Live mid-prices must never enter the indicator history.
-            for kline in self.collector.drain_closed_klines(key):
+            # A gap can be repaired by REST backfill, but a conflicting/reordered
+            # final candle is an immutable-data violation.  In either case no
+            # strategy consumer may advance until the collector is safe again.
+            if not self.collector.is_kline_stream_safe(key):
+                log.warning(
+                    "closed_bar.blocked_integrity",
+                    symbol=symbol,
+                    reason=self.collector.kline_integrity_reason(key),
+                )
+                continue
+
+            # Publish every complete bar before acknowledging the local queue.
+            # Snapshot/book freshness is deliberately separate: strategy parity is
+            # driven by final bars, while entry permission is decided later by the
+            # EVEDEX venue-quality gate.
+            for kline in self.collector.pending_closed_klines(key):
+                event = ClosedBarEventV1(
+                    source=self.settings.service_name,
+                    symbol=kline.symbol,
+                    timeframe=kline.timeframe,
+                    open_time_ms=kline.open_time_ms,
+                    close_time_ms=kline.close_time_ms,
+                    open=kline.open,
+                    high=kline.high,
+                    low=kline.low,
+                    close=kline.close,
+                    base_volume=kline.base_volume,
+                    quote_volume=kline.quote_volume,
+                    taker_buy_base_volume=kline.taker_buy_base_volume,
+                    taker_buy_quote_volume=kline.taker_buy_quote_volume,
+                )
+                await self.bus.publish(Topics.CLOSED_BAR, event)
+                self.collector.acknowledge_closed_klines(key, 1)
                 previous_close_time_ms = self._last_kline_close_time_ms.get(key)
+                if previous_close_time_ms == kline.close_time_ms:
+                    continue
                 if (
                     previous_close_time_ms is not None
                     and kline.close_time_ms - previous_close_time_ms != _ONE_MINUTE_MS
@@ -98,6 +148,54 @@ class QuantScoutsService:
                 rsi=round(snapshot.indicators.rsi_14, 1),
             )
 
+    async def _emit_venue_quality_once(self, session: aiohttp.ClientSession) -> None:
+        pairs = [(symbol.upper(), evedex_dev_symbol(symbol)) for symbol in self.settings.symbols]
+        results = await asyncio.gather(
+            *(
+                fetch_venue_quality(
+                    session,
+                    binance_symbol=binance_symbol,
+                    evedex_symbol=evedex_symbol,
+                    binance_base_url=self.settings.binance_rest_base,
+                    evedex_base_url=self.settings.evedex_dev_base_url,
+                    policy=self.venue_gate_policy,
+                    source=self.settings.service_name,
+                )
+                for binance_symbol, evedex_symbol in pairs
+            ),
+            return_exceptions=True,
+        )
+        for (binance_symbol, evedex_symbol), result in zip(pairs, results, strict=True):
+            if isinstance(result, BaseException):
+                log.warning(
+                    "venue_quality.unavailable",
+                    binance_symbol=binance_symbol,
+                    evedex_symbol=evedex_symbol,
+                    error=type(result).__name__,
+                )
+                continue
+            await self.bus.publish(Topics.VENUE_QUALITY, result)
+            log.info(
+                "venue_quality",
+                symbol=evedex_symbol,
+                entry_allowed=result.entry_allowed,
+                reasons=list(result.reason_codes),
+                basis_bps=round(result.basis_bps, 3),
+                spread_bps=round(result.spread_bps, 3),
+            )
+
+    async def _venue_quality_loop(self) -> None:
+        timeout = aiohttp.ClientTimeout(total=self.settings.venue_request_timeout_s)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            while True:
+                try:
+                    await self._emit_venue_quality_once(session)
+                except asyncio.CancelledError:
+                    raise
+                except (TimeoutError, aiohttp.ClientError, ValueError):
+                    log.exception("venue_quality.poll_failed")
+                await asyncio.sleep(self.settings.venue_quality_interval_s)
+
     async def run(self) -> None:  # pragma: no cover - requires network
         configure_logging(
             self.settings.log_level, json_logs=self.settings.log_json, service=self.settings.service_name
@@ -107,6 +205,8 @@ class QuantScoutsService:
             tasks.create_task(self.collector.run())
             tasks.create_task(self.collector.run_open_interest_loop(self.settings.open_interest_interval_s))
             tasks.create_task(self._emit_loop())
+            if self.settings.enable_venue_quality_gate:
+                tasks.create_task(self._venue_quality_loop(), name="evedex-dev-venue-quality")
 
 
 def main() -> None:  # pragma: no cover

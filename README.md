@@ -29,13 +29,16 @@ The development collector consumes Binance USD-M Futures combined streams:
 
 Open interest value and its one-hour change are refreshed periodically from Binance's
 5-minute statistics. Closed candles are backfilled over REST on startup and reconnect,
-then deduplicated against the WebSocket stream. Connections use bounded exponential
+then deduplicated against the WebSocket stream. Each accepted close is emitted as a
+strict `ClosedBarEventV1` containing the complete OHLCV, quote-volume and taker-buy
+volumes before it is acknowledged locally. A gap pauses that symbol until REST backfill
+repairs the exact sequence; a reordered or conflicting close fails the stream closed.
+Connections use bounded exponential
 backoff, and snapshots are suppressed when their book or last closed kline is stale.
 Funding and open interest must also have fresh successful observations; the OI series
 must be a contiguous 13-point five-minute grid and its last source point cannot be stale. Kline freshness
 checks both receipt time and the exchange close timestamp, so a newly received historical
-backfill cannot masquerade as current data. A gap in the one-minute candle sequence resets
-indicator history instead of blending unequal time intervals.
+backfill cannot masquerade as current data.
 Liquidation totals are removed only after their snapshot is published successfully.
 The production EVEDEX feed lives in
 [`kairos-execution-engine`](https://github.com/Kairos-cryptoAI/kairos-execution-engine)
@@ -62,6 +65,13 @@ more than two seconds of timestamp skew, p95 absolute basis/spread/slippage belo
 registered limits, and sufficient EVEDEX depth for the requested notional. Reports
 always set `live_orders_allowed=false`: a short PASS qualifies only that observation
 window and not future liquidity, order placement, fills, or custody.
+
+For PAPER, the same measurement runs continuously as a read-only runtime gate and emits
+`VenueQualityV1` for the exact `BTCUSD:DEV`, `ETHUSD:DEV`, `SOLUSD:DEV`, `BNBUSD:DEV`,
+and `XRPUSD:DEV` symbols. Enable it explicitly with
+`KAIROS_ENABLE_VENUE_QUALITY_GATE=true`. The service rejects any EVEDEX base URL other
+than the official DEV endpoint, and a stale, shallow or out-of-bounds observation can
+only block entry.
 
 ## Local development
 

@@ -135,11 +135,11 @@ class VenueComparisonReport:
 PairFetcher = Callable[[str, str], Awaitable[tuple[BookSnapshot, BookSnapshot]]]
 
 DEFAULT_SYMBOL_MAP = {
-    "BTCUSDT": "BTCUSD",
-    "ETHUSDT": "ETHUSD",
-    "SOLUSDT": "SOLUSD",
-    "BNBUSDT": "BNBUSD",
-    "XRPUSDT": "XRPUSD",
+    "BTCUSDT": "BTCUSD:DEV",
+    "ETHUSDT": "ETHUSD:DEV",
+    "SOLUSDT": "SOLUSD:DEV",
+    "BNBUSDT": "BNBUSD:DEV",
+    "XRPUSDT": "XRPUSD:DEV",
 }
 
 DEFAULT_THRESHOLDS = {
@@ -427,7 +427,7 @@ async def compare_public_venues(
     samples: int,
     interval_s: float,
     notional_usd: float,
-    evedex_base_url: str = "https://exchange-api.evedex.com",
+    evedex_base_url: str = "https://trading-api.evedex.tech",
     binance_base_url: str = "https://fapi.binance.com",
     timeout_s: float = 10.0,
 ) -> VenueComparisonReport:
