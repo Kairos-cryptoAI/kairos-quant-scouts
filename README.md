@@ -73,6 +73,13 @@ and `XRPUSD:DEV` symbols. Enable it explicitly with
 than the official DEV endpoint, and a stale, shallow or out-of-bounds observation can
 only block entry.
 
+The poller uses a monotonic start-to-start schedule, with all configured symbols fetched
+concurrently. Before public network I/O it persists one strict `ATTEMPTED` fact per
+symbol on `kairos.venue.poll.v1`; after the quality measurement is durable it persists
+`SUCCEEDED`, otherwise `FAILED`. The 24-hour operations gate derives its denominator
+from the latest durable interval and symbol-set fingerprint, so latency, failures,
+process downtime and configuration changes cannot inflate venue availability.
+
 ## Local development
 
 Install [uv](https://docs.astral.sh/uv/) once. The repository pins uv 0.12.3,

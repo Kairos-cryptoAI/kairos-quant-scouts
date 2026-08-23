@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import math
+import time
+from dataclasses import asdict
 
 import aiohttp
 from kairos_core.bus import build_bus
-from kairos_core.contracts import ClosedBarEventV1
+from kairos_core.contracts import ClosedBarEventV1, VenueQualityV1, canonical_sha256
 from kairos_core.logging import configure_logging, get_logger
 from kairos_core.topics import Topics
 from kairos_persistence import DurableMessageBus
@@ -19,10 +22,31 @@ from .runtime_venue_gate import (
     fetch_venue_quality,
 )
 from .snapshot import SnapshotBuilder
+from .venue_poll import (
+    VENUE_POLL_TOPIC,
+    VenuePollStatus,
+    build_venue_poll_fact,
+)
 
 log = get_logger("quant-scouts")
 
 _ONE_MINUTE_MS = 60_000
+
+
+def _advance_fixed_rate_deadline(
+    *,
+    previous_deadline: float,
+    interval_s: float,
+    now: float,
+) -> tuple[float, int]:
+    """Advance a start-to-start schedule without latency drift or catch-up bursts."""
+
+    next_deadline = previous_deadline + interval_s
+    skipped = 0
+    if next_deadline <= now:
+        skipped = math.floor((now - next_deadline) / interval_s) + 1
+        next_deadline += skipped * interval_s
+    return next_deadline, skipped
 
 
 class QuantScoutsService:
@@ -57,6 +81,28 @@ class QuantScoutsService:
             measurement_ttl_ms=self.settings.venue_quality_ttl_ms,
             taker_fee_bps=self.settings.venue_taker_fee_bps,
         )
+        self._venue_pairs = tuple(
+            sorted(
+                ((symbol.upper(), evedex_dev_symbol(symbol)) for symbol in self.settings.symbols),
+                key=lambda pair: pair[1],
+            )
+        )
+        self._venue_expected_symbols = tuple(pair[1] for pair in self._venue_pairs)
+        self._venue_interval_ms = math.ceil(self.settings.venue_quality_interval_s * 1_000)
+        self._venue_config_fingerprint = canonical_sha256(
+            {
+                "contract_version": "venue-poll-config.v1",
+                "source": self.settings.service_name,
+                "pairs": self._venue_pairs,
+                "interval_ms": self._venue_interval_ms,
+                "request_timeout_ms": math.ceil(self.settings.venue_request_timeout_s * 1_000),
+                "binance_base_url": self.settings.binance_rest_base.rstrip("/"),
+                "evedex_base_url": self.settings.evedex_dev_base_url.rstrip("/"),
+                "policy": asdict(self.venue_gate_policy),
+            }
+        )
+        self._venue_monotonic = time.monotonic
+        self._venue_wall_clock_ms = lambda: int(time.time() * 1_000)
 
     async def _emit_loop(self) -> None:
         while True:
@@ -148,8 +194,39 @@ class QuantScoutsService:
                 rsi=round(snapshot.indicators.rsi_14, 1),
             )
 
-    async def _emit_venue_quality_once(self, session: aiohttp.ClientSession) -> None:
-        pairs = [(symbol.upper(), evedex_dev_symbol(symbol)) for symbol in self.settings.symbols]
+    async def _emit_venue_quality_once(
+        self,
+        session: aiohttp.ClientSession,
+        *,
+        scheduled_at_ms: int | None = None,
+    ) -> None:
+        """Persist each attempt before concurrent public reads and its outcome after.
+
+        A success is recorded only after the corresponding ``VenueQualityV1``
+        event is durable. Missing attempts and missing terminal outcomes therefore
+        reduce the 24-hour availability ratio instead of disappearing from it.
+        """
+
+        if scheduled_at_ms is None:
+            now_ms = self._venue_wall_clock_ms()
+            scheduled_at_ms = now_ms - (now_ms % self._venue_interval_ms)
+        attempted_at_ms = max(scheduled_at_ms, self._venue_wall_clock_ms())
+        attempts = tuple(
+            build_venue_poll_fact(
+                source=self.settings.service_name,
+                config_fingerprint=self._venue_config_fingerprint,
+                status=VenuePollStatus.ATTEMPTED,
+                binance_symbol=binance_symbol,
+                venue_symbol=evedex_symbol,
+                expected_symbols=self._venue_expected_symbols,
+                interval_ms=self._venue_interval_ms,
+                scheduled_at_ms=scheduled_at_ms,
+                attempted_at_ms=attempted_at_ms,
+            )
+            for binance_symbol, evedex_symbol in self._venue_pairs
+        )
+        await asyncio.gather(*(self.bus.publish(VENUE_POLL_TOPIC, fact) for fact in attempts))
+
         results = await asyncio.gather(
             *(
                 fetch_venue_quality(
@@ -161,20 +238,53 @@ class QuantScoutsService:
                     policy=self.venue_gate_policy,
                     source=self.settings.service_name,
                 )
-                for binance_symbol, evedex_symbol in pairs
+                for binance_symbol, evedex_symbol in self._venue_pairs
             ),
             return_exceptions=True,
         )
-        for (binance_symbol, evedex_symbol), result in zip(pairs, results, strict=True):
+
+        async def persist_outcome(
+            binance_symbol: str,
+            evedex_symbol: str,
+            result: VenueQualityV1 | BaseException,
+        ) -> None:
+            completed_at_ms = max(attempted_at_ms, self._venue_wall_clock_ms())
             if isinstance(result, BaseException):
+                failure = build_venue_poll_fact(
+                    source=self.settings.service_name,
+                    config_fingerprint=self._venue_config_fingerprint,
+                    status=VenuePollStatus.FAILED,
+                    binance_symbol=binance_symbol,
+                    venue_symbol=evedex_symbol,
+                    expected_symbols=self._venue_expected_symbols,
+                    interval_ms=self._venue_interval_ms,
+                    scheduled_at_ms=scheduled_at_ms,
+                    attempted_at_ms=attempted_at_ms,
+                    completed_at_ms=completed_at_ms,
+                    failure_code=type(result).__name__,
+                )
+                await self.bus.publish(VENUE_POLL_TOPIC, failure)
                 log.warning(
                     "venue_quality.unavailable",
                     binance_symbol=binance_symbol,
                     evedex_symbol=evedex_symbol,
                     error=type(result).__name__,
                 )
-                continue
+                return
             await self.bus.publish(Topics.VENUE_QUALITY, result)
+            success = build_venue_poll_fact(
+                source=self.settings.service_name,
+                config_fingerprint=self._venue_config_fingerprint,
+                status=VenuePollStatus.SUCCEEDED,
+                binance_symbol=binance_symbol,
+                venue_symbol=evedex_symbol,
+                expected_symbols=self._venue_expected_symbols,
+                interval_ms=self._venue_interval_ms,
+                scheduled_at_ms=scheduled_at_ms,
+                attempted_at_ms=attempted_at_ms,
+                completed_at_ms=completed_at_ms,
+            )
+            await self.bus.publish(VENUE_POLL_TOPIC, success)
             log.info(
                 "venue_quality",
                 symbol=evedex_symbol,
@@ -184,17 +294,41 @@ class QuantScoutsService:
                 spread_bps=round(result.spread_bps, 3),
             )
 
+        await asyncio.gather(
+            *(
+                persist_outcome(binance_symbol, evedex_symbol, result)
+                for (binance_symbol, evedex_symbol), result in zip(
+                    self._venue_pairs,
+                    results,
+                    strict=True,
+                )
+            )
+        )
+
     async def _venue_quality_loop(self) -> None:
         timeout = aiohttp.ClientTimeout(total=self.settings.venue_request_timeout_s)
         async with aiohttp.ClientSession(timeout=timeout) as session:
+            next_deadline = self._venue_monotonic()
+            now_ms = self._venue_wall_clock_ms()
+            scheduled_at_ms = now_ms - (now_ms % self._venue_interval_ms)
             while True:
+                delay = next_deadline - self._venue_monotonic()
+                if delay > 0:
+                    await asyncio.sleep(delay)
                 try:
-                    await self._emit_venue_quality_once(session)
+                    await self._emit_venue_quality_once(session, scheduled_at_ms=scheduled_at_ms)
                 except asyncio.CancelledError:
                     raise
                 except (TimeoutError, aiohttp.ClientError, ValueError):
                     log.exception("venue_quality.poll_failed")
-                await asyncio.sleep(self.settings.venue_quality_interval_s)
+                next_deadline, skipped = _advance_fixed_rate_deadline(
+                    previous_deadline=next_deadline,
+                    interval_s=self.settings.venue_quality_interval_s,
+                    now=self._venue_monotonic(),
+                )
+                if skipped:
+                    log.warning("venue_quality.poll_slots_skipped", count=skipped)
+                scheduled_at_ms += (skipped + 1) * self._venue_interval_ms
 
     async def run(self) -> None:  # pragma: no cover - requires network
         configure_logging(

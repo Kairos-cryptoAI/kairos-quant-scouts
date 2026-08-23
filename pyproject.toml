@@ -32,7 +32,7 @@ required-version = "==0.12.3"
 
 [tool.uv.sources]
 kairos-core = { git = "https://github.com/Kairos-cryptoAI/kairos-core.git", rev = "a4f427cdd44184fac62a842320133ac5a3e11fbe" }
-kairos-persistence = { git = "https://github.com/Kairos-cryptoAI/kairos-persistence.git", rev = "6d3363511170aa966afc94d6ba1bba15cd8ce83a" }
+kairos-persistence = { git = "https://github.com/Kairos-cryptoAI/kairos-persistence.git", rev = "e36a3c01aa8aa3847bfbc8fa42eb4f98794d28a5" }
 
 [project.scripts]
 kairos-quant-scouts = "kairos_quant.service:main"
