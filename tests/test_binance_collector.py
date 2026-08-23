@@ -40,11 +40,16 @@ def test_only_closed_unique_klines_are_buffered():
         "data": {
             "k": {
                 "x": True,
+                "t": 0,
                 "T": 59_999,
+                "o": "100",
                 "h": "104",
                 "l": "99",
                 "c": "102.5",
+                "v": "25",
                 "q": "2750",
+                "V": "12",
+                "Q": "1320",
             }
         },
     }
@@ -55,6 +60,13 @@ def test_only_closed_unique_klines_are_buffered():
     assert [(item.close_time_ms, item.high, item.low, item.close, item.quote_volume) for item in klines] == [
         (59_999, 104.0, 99.0, 102.5, 2750.0)
     ]
+    assert klines[0].symbol == "BTCUSDT"
+    assert klines[0].timeframe == "1m"
+    assert klines[0].open_time_ms == 0
+    assert klines[0].open == 100.0
+    assert klines[0].base_volume == 25.0
+    assert klines[0].taker_buy_base_volume == 12.0
+    assert klines[0].taker_buy_quote_volume == 1320.0
     assert collector.volume_usd["btcusdt"] == 2750.0
 
 
@@ -95,11 +107,16 @@ def test_market_data_freshness_uses_receive_time():
             "data": {
                 "k": {
                     "x": True,
+                    "t": 0,
                     "T": 59_999,
+                    "o": "100",
                     "h": "101",
                     "l": "99",
                     "c": "100.5",
+                    "v": "10",
                     "q": "1000",
+                    "V": "5",
+                    "Q": "500",
                 }
             },
         }
@@ -223,7 +240,21 @@ def test_kline_backfill_excludes_open_candle_and_deduplicates_stream_replay():
     collector._on_message(
         {
             "stream": "btcusdt@kline_1m",
-            "data": {"k": {"x": True, "T": 119_999, "h": "120", "l": "90", "c": "110"}},
+            "data": {
+                "k": {
+                    "x": True,
+                    "t": 60_000,
+                    "T": 119_999,
+                    "o": "100",
+                    "h": "120",
+                    "l": "90",
+                    "c": "110",
+                    "v": "1",
+                    "q": "600",
+                    "V": "0",
+                    "Q": "0",
+                }
+            },
         }
     )
 
@@ -239,11 +270,16 @@ def _closed_kline(close_time_ms: int, *, close: str = "100", quote_volume: str =
         "data": {
             "k": {
                 "x": True,
+                "t": close_time_ms - 59_999,
                 "T": close_time_ms,
+                "o": close,
                 "h": str(float(close) + 1),
                 "l": str(float(close) - 1),
                 "c": close,
+                "v": "10",
                 "q": quote_volume,
+                "V": "5",
+                "Q": str(float(quote_volume) / 2),
             }
         },
     }
@@ -257,6 +293,8 @@ def test_gap_is_held_until_missing_candle_arrives_then_emitted_in_order():
 
     assert [item.close_time_ms for item in collector.drain_closed_klines("btcusdt")] == [59_999]
     assert "btcusdt" in collector._needs_kline_backfill
+    assert not collector.is_kline_stream_safe("btcusdt")
+    assert collector.kline_integrity_reason("btcusdt") == "gap_waiting_for_backfill"
 
     collector._on_message(_closed_kline(119_999, close="101"))
 
@@ -265,6 +303,39 @@ def test_gap_is_held_until_missing_candle_arrives_then_emitted_in_order():
         179_999,
     ]
     assert collector._needs_kline_backfill == set()
+    assert collector.is_kline_stream_safe("btcusdt")
+
+
+def test_conflicting_closed_bar_permanently_blocks_strategy_stream():
+    collector = _collector(wall_clock=lambda: 120.0)
+    assert collector._on_message(_closed_kline(59_999, close="100"))
+
+    assert not collector._on_message(_closed_kline(59_999, close="101"))
+
+    assert not collector.is_kline_stream_safe("btcusdt")
+    assert collector.kline_integrity_reason("btcusdt") == "conflicting_closed_bar"
+
+
+def test_unknown_reordered_bar_blocks_strategy_stream():
+    collector = _collector(wall_clock=lambda: 180.0)
+    assert collector._on_message(_closed_kline(119_999, close="101"))
+
+    assert not collector._on_message(_closed_kline(59_999, close="100"))
+
+    assert not collector.is_kline_stream_safe("btcusdt")
+    assert collector.kline_integrity_reason("btcusdt") == "reordered_closed_bar"
+
+
+def test_pending_bars_are_acknowledged_only_after_publish():
+    collector = _collector(wall_clock=lambda: 120.0)
+    assert collector._on_message(_closed_kline(59_999))
+
+    assert [bar.close_time_ms for bar in collector.pending_closed_klines("BTCUSDT")] == [59_999]
+    collector.acknowledge_closed_klines("btcusdt", 1)
+
+    assert collector.pending_closed_klines("btcusdt") == ()
+    with pytest.raises(ValueError, match="exceeds"):
+        collector.acknowledge_closed_klines("btcusdt", 1)
 
 
 def test_duplicate_final_candle_does_not_extend_freshness():
@@ -457,8 +528,8 @@ class _BoundaryResponse(_KlineResponse):
     async def json(self):
         self.wall_now[0] = 60.1
         return [
-            [0, "99", "101", "99", "100", "1", 59_999, "1000"],
-            [60_000, "100", "102", "100", "101", "1", 119_999, "1000"],
+            [0, "99", "101", "99", "100", "1", 59_999, "1000", 1, "0.5", "500"],
+            [60_000, "100", "102", "100", "101", "1", 119_999, "1000", 1, "0.5", "500"],
         ]
 
 

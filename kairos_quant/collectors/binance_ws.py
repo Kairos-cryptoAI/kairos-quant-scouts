@@ -31,11 +31,18 @@ _LIQUIDATION_DEDUP_SIZE = 10_000
 
 @dataclass(frozen=True, slots=True)
 class ClosedKline:
+    symbol: str
+    timeframe: str
+    open_time_ms: int
     close_time_ms: int
+    open: float
     high: float
     low: float
     close: float
+    base_volume: float
     quote_volume: float
+    taker_buy_base_volume: float
+    taker_buy_quote_volume: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +93,8 @@ class BinanceFuturesCollector:
         }
         self._pending_klines: dict[str, dict[int, ClosedKline]] = {symbol: {} for symbol in self.symbols}
         self._needs_kline_backfill: set[str] = set()
+        self._known_klines: dict[str, dict[int, ClosedKline]] = {symbol: {} for symbol in self.symbols}
+        self._kline_integrity_error: dict[str, str | None] = dict.fromkeys(self.symbols)
         self._last_kline_close_time_ms: dict[str, int] = dict.fromkeys(self.symbols, 0)
         self._long_liquidations_usd: dict[str, float] = dict.fromkeys(self.symbols, 0.0)
         self._short_liquidations_usd: dict[str, float] = dict.fromkeys(self.symbols, 0.0)
@@ -214,17 +223,43 @@ class BinanceFuturesCollector:
         if not isinstance(kline, dict) or kline.get("x") is not True:
             return False
 
+        open_time_ms = self._integer(kline.get("t"))
         close_time_ms = self._integer(kline.get("T"))
-        if close_time_ms is None or close_time_ms >= int(self._wall_clock() * 1_000):
+        if open_time_ms is None or close_time_ms is None or close_time_ms >= int(self._wall_clock() * 1_000):
             return False
 
+        open_price = self._finite_float(kline.get("o"))
         close = self._finite_float(kline.get("c"))
         high = self._finite_float(kline.get("h"))
         low = self._finite_float(kline.get("l"))
+        base_volume = self._finite_float(kline.get("v"))
         quote_volume = self._finite_float(kline.get("q"))
-        if close is None or high is None or low is None or quote_volume is None:
+        taker_buy_base_volume = self._finite_float(kline.get("V"))
+        taker_buy_quote_volume = self._finite_float(kline.get("Q"))
+        if (
+            open_price is None
+            or close is None
+            or high is None
+            or low is None
+            or base_volume is None
+            or quote_volume is None
+            or taker_buy_base_volume is None
+            or taker_buy_quote_volume is None
+        ):
             return False
-        return self._append_closed_kline(symbol, close_time_ms, high, low, close, quote_volume)
+        return self._append_closed_kline(
+            symbol,
+            open_time_ms,
+            close_time_ms,
+            open_price,
+            high,
+            low,
+            close,
+            base_volume,
+            quote_volume,
+            taker_buy_base_volume,
+            taker_buy_quote_volume,
+        )
 
     def _on_liquidation(self, symbol: str, data: dict) -> bool:
         order = data.get("o", {})
@@ -268,6 +303,40 @@ class BinanceFuturesCollector:
         klines = list(pending)
         pending.clear()
         return klines
+
+    def pending_closed_klines(self, symbol: str) -> tuple[ClosedKline, ...]:
+        """Return publishable bars without acknowledging them.
+
+        The service acknowledges only after every durable publish succeeds.  This
+        keeps a transient bus failure from silently dropping the strategy input.
+        Consumers still deduplicate by the deterministic closed-bar hash.
+        """
+        pending = self._closed_klines.get(symbol.lower())
+        return tuple(pending) if pending is not None else ()
+
+    def acknowledge_closed_klines(self, symbol: str, count: int) -> None:
+        if count < 0:
+            raise ValueError("closed-kline acknowledgement count cannot be negative")
+        pending = self._closed_klines.get(symbol.lower())
+        if pending is None or count > len(pending):
+            raise ValueError("closed-kline acknowledgement exceeds pending bars")
+        for _ in range(count):
+            pending.popleft()
+
+    def is_kline_stream_safe(self, symbol: str) -> bool:
+        """Whether strategy consumers may advance this symbol's bar stream."""
+        key = symbol.lower()
+        return (
+            key in self._closed_klines
+            and key not in self._needs_kline_backfill
+            and self._kline_integrity_error.get(key) is None
+        )
+
+    def kline_integrity_reason(self, symbol: str) -> str | None:
+        key = symbol.lower()
+        if key in self._needs_kline_backfill:
+            return "gap_waiting_for_backfill"
+        return self._kline_integrity_error.get(key)
 
     def drain_liquidations(self, symbol: str) -> LiquidationTotals:
         totals = self.liquidation_totals(symbol)
@@ -441,35 +510,51 @@ class BinanceFuturesCollector:
                     # Evaluate closure after the awaited response so a candle that
                     # closes while the request is in flight is not lost forever.
                     now_ms = int(self._wall_clock() * 1_000)
-                    closed_klines: list[tuple[int, float, float, float, float]] = []
+                    closed_klines: list[
+                        tuple[int, int, float, float, float, float, float, float, float, float]
+                    ] = []
                     for item in body:
-                        if not isinstance(item, list) or len(item) < 8:
+                        if not isinstance(item, list) or len(item) < 11:
                             continue
+                        open_time_ms = self._integer(item[0])
                         close_time_ms = self._integer(item[6])
-                        if close_time_ms is None:
+                        if open_time_ms is None or close_time_ms is None:
                             continue
                         if close_time_ms >= now_ms:
                             continue
+                        open_price = self._finite_float(item[1])
                         high = self._finite_float(item[2])
                         low = self._finite_float(item[3])
                         close = self._finite_float(item[4])
+                        base_volume = self._finite_float(item[5])
                         quote_volume = self._finite_float(item[7])
+                        taker_buy_base_volume = self._finite_float(item[9])
+                        taker_buy_quote_volume = self._finite_float(item[10])
                         if (
-                            high is not None
+                            open_price is not None
+                            and high is not None
                             and low is not None
                             and close is not None
+                            and base_volume is not None
                             and quote_volume is not None
+                            and taker_buy_base_volume is not None
+                            and taker_buy_quote_volume is not None
                         ):
                             closed_klines.append(
                                 (
+                                    open_time_ms,
                                     close_time_ms,
+                                    open_price,
                                     high,
                                     low,
                                     close,
+                                    base_volume,
                                     quote_volume,
+                                    taker_buy_base_volume,
+                                    taker_buy_quote_volume,
                                 )
                             )
-                    for values in sorted(closed_klines, key=lambda item: item[0]):
+                    for values in sorted(closed_klines, key=lambda item: item[1]):
                         self._append_closed_kline(symbol, *values)
             except (TimeoutError, aiohttp.ClientError, TypeError, ValueError) as exc:
                 log.warning(
@@ -481,35 +566,70 @@ class BinanceFuturesCollector:
     def _append_closed_kline(
         self,
         symbol: str,
+        open_time_ms: int,
         close_time_ms: int,
+        open_price: float,
         high: float,
         low: float,
         close: float,
+        base_volume: float,
         quote_volume: float,
+        taker_buy_base_volume: float,
+        taker_buy_quote_volume: float,
     ) -> bool:
+        prices = (open_price, high, low, close)
+        volumes = (
+            base_volume,
+            quote_volume,
+            taker_buy_base_volume,
+            taker_buy_quote_volume,
+        )
         if (
-            close_time_ms <= self._last_kline_close_time_ms[symbol]
-            or close_time_ms <= 0
+            open_time_ms < 0
+            or close_time_ms != open_time_ms + _ONE_MINUTE_MS - 1
             or close_time_ms % _ONE_MINUTE_MS != _ONE_MINUTE_MS - 1
-            or not all(math.isfinite(value) for value in (high, low, close, quote_volume))
-            or min(high, low, close) <= 0
-            or high < low
-            or not low <= close <= high
-            or quote_volume < 0
+            or not all(math.isfinite(value) for value in (*prices, *volumes))
+            or min(prices) <= 0
+            or high < max(open_price, close)
+            or low > min(open_price, close)
+            or min(volumes) < 0
+            or taker_buy_base_volume > base_volume
+            or taker_buy_quote_volume > quote_volume
         ):
-            return False
-        pending = self._pending_klines[symbol]
-        if close_time_ms in pending:
             return False
 
         candle = ClosedKline(
+            symbol=symbol.upper(),
+            timeframe="1m",
+            open_time_ms=open_time_ms,
             close_time_ms=close_time_ms,
+            open=open_price,
             high=high,
             low=low,
             close=close,
+            base_volume=base_volume,
             quote_volume=quote_volume,
+            taker_buy_base_volume=taker_buy_base_volume,
+            taker_buy_quote_volume=taker_buy_quote_volume,
         )
+        known = self._known_klines[symbol].get(close_time_ms)
+        if known is not None:
+            if known != candle:
+                self._kline_integrity_error[symbol] = "conflicting_closed_bar"
+            return False
+
         last_close_time_ms = self._last_kline_close_time_ms[symbol]
+        if last_close_time_ms and close_time_ms < last_close_time_ms:
+            self._kline_integrity_error[symbol] = "reordered_closed_bar"
+            return False
+
+        pending = self._pending_klines[symbol]
+        pending_at_time = pending.get(close_time_ms)
+        if pending_at_time is not None:
+            if pending_at_time != candle:
+                self._kline_integrity_error[symbol] = "conflicting_closed_bar"
+            return False
+
         if last_close_time_ms and close_time_ms != last_close_time_ms + _ONE_MINUTE_MS:
             pending[close_time_ms] = candle
             if len(pending) > self._kline_buffer_size:
@@ -528,6 +648,10 @@ class BinanceFuturesCollector:
 
     def _promote_closed_kline(self, symbol: str, candle: ClosedKline) -> None:
         self._closed_klines[symbol].append(candle)
+        known = self._known_klines[symbol]
+        known[candle.close_time_ms] = candle
+        while len(known) > self._kline_buffer_size:
+            known.pop(min(known))
         self._last_kline_close_time_ms[symbol] = candle.close_time_ms
         self._kline_updated_at[symbol] = self._clock()
         self.volume_usd[symbol] = candle.quote_volume
