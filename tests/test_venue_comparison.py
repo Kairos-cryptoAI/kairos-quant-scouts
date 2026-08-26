@@ -8,6 +8,7 @@ from kairos_quant.venue_comparison import (
     BookLevel,
     BookSnapshot,
     ComparisonStatus,
+    EvedexBookUnavailableError,
     _write_report,
     compare_venues,
     market_slippage_bps,
@@ -61,6 +62,15 @@ def test_book_parsers_validate_shape_order_and_transaction_time():
         parse_binance_book(
             "BTCUSDT",
             {"T": NOW_MS, "bids": [[99, 1], [100, 1]], "asks": [[101, 1]]},
+            latency_ms=1,
+        )
+
+
+def test_empty_listed_evedex_book_has_a_stable_operational_failure_code():
+    with pytest.raises(EvedexBookUnavailableError, match="no executable"):
+        parse_evedex_book(
+            "SOLUSD:DEV",
+            {"t": NOW_MS, "bids": [], "asks": []},
             latency_ms=1,
         )
 

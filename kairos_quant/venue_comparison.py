@@ -28,6 +28,10 @@ class ComparisonStatus(StrEnum):
     FAIL = "FAIL"
 
 
+class EvedexBookUnavailableError(ValueError):
+    """The public instrument exists but has no executable two-sided book."""
+
+
 @dataclass(frozen=True)
 class BookLevel:
     price: float
@@ -197,6 +201,8 @@ def parse_evedex_book(symbol: str, payload: Any, *, latency_ms: float) -> BookSn
 
     bids = levels("bids")
     asks = levels("asks")
+    if not bids or not asks:
+        raise EvedexBookUnavailableError("EVEDEX order book has no executable two-sided liquidity")
     if tuple(sorted(bids, key=lambda item: item.price, reverse=True)) != bids:
         raise ValueError("EVEDEX bids are not sorted best-first")
     if tuple(sorted(asks, key=lambda item: item.price)) != asks:
