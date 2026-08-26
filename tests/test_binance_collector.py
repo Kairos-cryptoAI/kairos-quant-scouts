@@ -472,6 +472,35 @@ def test_funding_freshness_requires_a_valid_observation():
     assert collector.is_funding_fresh("btcusdt", 10)
 
 
+def test_exchange_freshness_tolerates_only_the_bounded_future_skew():
+    collector = _collector(wall_clock=lambda: 1_000.0)
+    assert collector._on_message(
+        {
+            "stream": "btcusdt@depth10@100ms",
+            "data": {"E": 1_001_999, "u": 1, "b": [["100", "1"]], "a": [["101", "1"]]},
+        }
+    )
+    assert collector.is_book_fresh("btcusdt", 10)
+
+    assert collector._on_message(
+        {
+            "stream": "btcusdt@depth10@100ms",
+            "data": {"E": 1_002_001, "u": 2, "b": [["100", "1"]], "a": [["101", "1"]]},
+        }
+    )
+    assert not collector.is_book_fresh("btcusdt", 10)
+
+
+def test_negative_exchange_future_skew_limit_is_rejected():
+    with pytest.raises(ValueError, match="future skew"):
+        BinanceFuturesCollector(
+            ["BTCUSDT"],
+            "wss://example.invalid/stream",
+            "https://example.invalid",
+            max_exchange_future_skew_s=-0.001,
+        )
+
+
 def test_old_funding_event_cannot_regress_or_refresh_the_current_value():
     now = [100.0]
     collector = _collector(clock=lambda: now[0])

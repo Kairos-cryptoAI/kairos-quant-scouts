@@ -61,6 +61,7 @@ class BinanceFuturesCollector:
         reconnect_initial_s: float = 1.0,
         reconnect_max_s: float = 30.0,
         kline_buffer_size: int = 1_000,
+        max_exchange_future_skew_s: float = 2.0,
         clock: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], float] = time.time,
     ) -> None:
@@ -68,6 +69,8 @@ class BinanceFuturesCollector:
             raise ValueError("invalid reconnect backoff")
         if kline_buffer_size <= 0:
             raise ValueError("kline_buffer_size must be positive")
+        if max_exchange_future_skew_s < 0:
+            raise ValueError("maximum exchange future skew cannot be negative")
 
         self.symbols = list(dict.fromkeys(symbol.strip().lower() for symbol in symbols))
         if not self.symbols or any(not symbol for symbol in self.symbols):
@@ -79,6 +82,7 @@ class BinanceFuturesCollector:
         self._clock = clock
         self._wall_clock = wall_clock
         self._kline_buffer_size = kline_buffer_size
+        self._max_exchange_future_skew_s = max_exchange_future_skew_s
 
         self.books: dict[str, dict[str, list[Level]]] = {
             symbol: {"bids": [], "asks": []} for symbol in self.symbols
@@ -425,7 +429,7 @@ class BinanceFuturesCollector:
         if max_age_s <= 0 or event_time_ms is None:
             return False
         event_age_s = self._wall_clock() - event_time_ms / 1_000.0
-        return 0 <= event_age_s <= max_age_s
+        return -self._max_exchange_future_skew_s <= event_age_s <= max_age_s
 
     async def refresh_open_interest(
         self, session: aiohttp.ClientSession | None = None

@@ -26,6 +26,7 @@ class QuantSettings(CoreSettings):
     book_stale_after_s: float = Field(default=10.0, gt=0)
     kline_stale_after_s: float = Field(default=90.0, gt=0)
     derivatives_stale_after_s: float = Field(default=180.0, gt=0)
+    maximum_binance_future_skew_ms: int = Field(default=2_000, ge=0)
     ws_reconnect_initial_s: float = Field(default=1.0, gt=0)
     ws_reconnect_max_s: float = Field(default=30.0, gt=0)
 

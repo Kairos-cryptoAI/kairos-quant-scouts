@@ -71,6 +71,7 @@ class QuantScoutsService:
             reconnect_initial_s=self.settings.ws_reconnect_initial_s,
             reconnect_max_s=self.settings.ws_reconnect_max_s,
             kline_buffer_size=self.settings.price_window,
+            max_exchange_future_skew_s=self.settings.maximum_binance_future_skew_ms / 1_000,
         )
         self._last_kline_close_time_ms: dict[str, int] = {}
         self.venue_gate_policy = VenueGatePolicy(
