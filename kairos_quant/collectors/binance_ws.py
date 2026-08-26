@@ -27,6 +27,7 @@ _ONE_MINUTE_MS = 60_000
 _OPEN_INTEREST_PERIOD_MS = 5 * _ONE_MINUTE_MS
 _OPEN_INTEREST_MAX_SOURCE_LAG_MS = 2 * _OPEN_INTEREST_PERIOD_MS
 _LIQUIDATION_DEDUP_SIZE = 10_000
+_REST_CONFIRMATIONS_REQUIRED = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +62,7 @@ class BinanceFuturesCollector:
         reconnect_initial_s: float = 1.0,
         reconnect_max_s: float = 30.0,
         kline_buffer_size: int = 1_000,
+        kline_finality_delay_s: float = 5.0,
         max_exchange_future_skew_s: float = 2.0,
         clock: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], float] = time.time,
@@ -69,6 +71,8 @@ class BinanceFuturesCollector:
             raise ValueError("invalid reconnect backoff")
         if kline_buffer_size <= 0:
             raise ValueError("kline_buffer_size must be positive")
+        if kline_finality_delay_s < 0:
+            raise ValueError("kline finality delay cannot be negative")
         if max_exchange_future_skew_s < 0:
             raise ValueError("maximum exchange future skew cannot be negative")
 
@@ -82,6 +86,7 @@ class BinanceFuturesCollector:
         self._clock = clock
         self._wall_clock = wall_clock
         self._kline_buffer_size = kline_buffer_size
+        self._kline_finality_delay_ms = math.ceil(kline_finality_delay_s * 1_000)
         self._max_exchange_future_skew_s = max_exchange_future_skew_s
 
         self.books: dict[str, dict[str, list[Level]]] = {
@@ -96,6 +101,12 @@ class BinanceFuturesCollector:
             symbol: deque(maxlen=kline_buffer_size) for symbol in self.symbols
         }
         self._pending_klines: dict[str, dict[int, ClosedKline]] = {symbol: {} for symbol in self.symbols}
+        self._ws_closed_candidates: dict[str, dict[int, ClosedKline]] = {
+            symbol: {} for symbol in self.symbols
+        }
+        self._rest_closed_candidates: dict[str, dict[int, tuple[ClosedKline, int]]] = {
+            symbol: {} for symbol in self.symbols
+        }
         self._needs_kline_backfill: set[str] = set()
         self._known_klines: dict[str, dict[int, ClosedKline]] = {symbol: {} for symbol in self.symbols}
         self._kline_integrity_error: dict[str, str | None] = dict.fromkeys(self.symbols)
@@ -231,7 +242,11 @@ class BinanceFuturesCollector:
 
         open_time_ms = self._integer(kline.get("t"))
         close_time_ms = self._integer(kline.get("T"))
-        if open_time_ms is None or close_time_ms is None or close_time_ms >= int(self._wall_clock() * 1_000):
+        if (
+            open_time_ms is None
+            or close_time_ms is None
+            or close_time_ms > int((self._wall_clock() + self._max_exchange_future_skew_s) * 1_000)
+        ):
             return False
 
         open_price = self._finite_float(kline.get("o"))
@@ -253,7 +268,7 @@ class BinanceFuturesCollector:
             or taker_buy_quote_volume is None
         ):
             return False
-        return self._append_closed_kline(
+        candle = self._make_closed_kline(
             symbol,
             open_time_ms,
             close_time_ms,
@@ -266,6 +281,17 @@ class BinanceFuturesCollector:
             taker_buy_base_volume,
             taker_buy_quote_volume,
         )
+        if candle is None:
+            return False
+        candidates = self._ws_closed_candidates[symbol]
+        previous = candidates.get(candle.close_time_ms)
+        candidates[candle.close_time_ms] = candle
+        while len(candidates) > self._kline_buffer_size:
+            candidates.pop(min(candidates))
+        # Binance can revise a provisional x=true candle.  WebSocket closure is
+        # therefore useful liveness evidence, but never authoritative strategy
+        # input; two stable delayed REST observations own finality.
+        return previous != candle
 
     def _on_liquidation(self, symbol: str, data: dict) -> bool:
         order = data.get("o", {})
@@ -516,6 +542,63 @@ class BinanceFuturesCollector:
                     log.warning("binance.open_interest_error", error=type(exc).__name__)
                 await asyncio.sleep(interval_s)
 
+    async def refresh_funding(
+        self, session: aiohttp.ClientSession | None = None
+    ) -> None:  # pragma: no cover - network is covered through fakes
+        """Refresh funding from the official REST snapshot when WS is unavailable."""
+
+        if session is None:
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=timeout) as owned_session:
+                await self._refresh_funding(owned_session)
+            return
+        await self._refresh_funding(session)
+
+    async def _refresh_funding(self, session: aiohttp.ClientSession) -> None:
+        url = f"{self.rest_base}/fapi/v1/premiumIndex"
+        try:
+            async with session.get(url) as response:
+                if response.status != 200:
+                    log.warning("binance.funding_failed", status=response.status)
+                    return
+                body = await response.json()
+                records = body if isinstance(body, list) else [body]
+                for item in records:
+                    if not isinstance(item, dict):
+                        continue
+                    symbol = str(item.get("symbol", "")).lower()
+                    if symbol not in self.funding:
+                        continue
+                    funding = self._finite_float(item.get("lastFundingRate"))
+                    event_time_ms = self._integer(item.get("time"))
+                    previous_event_time_ms = self._funding_event_time_ms[symbol]
+                    if (
+                        funding is None
+                        or event_time_ms is None
+                        or event_time_ms <= 0
+                        or (previous_event_time_ms is not None and event_time_ms <= previous_event_time_ms)
+                    ):
+                        continue
+                    self.funding[symbol] = funding
+                    self._funding_event_time_ms[symbol] = event_time_ms
+                    self._funding_updated_at[symbol] = self._clock()
+        except (TimeoutError, aiohttp.ClientError, TypeError, ValueError) as exc:
+            log.warning("binance.funding_error", error=type(exc).__name__)
+
+    async def run_funding_loop(self, interval_s: float) -> None:
+        if interval_s <= 0:
+            raise ValueError("funding interval must be positive")
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            while True:
+                try:
+                    await self.refresh_funding(session)
+                except asyncio.CancelledError:
+                    raise
+                except (TimeoutError, aiohttp.ClientError, TypeError, ValueError) as exc:
+                    log.warning("binance.funding_error", error=type(exc).__name__)
+                await asyncio.sleep(interval_s)
+
     async def run_kline_reconciliation_loop(self, interval_s: float) -> None:
         """Continuously compare final WebSocket bars with Binance REST history."""
 
@@ -576,7 +659,7 @@ class BinanceFuturesCollector:
                         close_time_ms = self._integer(item[6])
                         if open_time_ms is None or close_time_ms is None:
                             continue
-                        if close_time_ms >= now_ms:
+                        if close_time_ms > now_ms - self._kline_finality_delay_ms:
                             continue
                         open_price = self._finite_float(item[1])
                         high = self._finite_float(item[2])
@@ -611,7 +694,7 @@ class BinanceFuturesCollector:
                                 )
                             )
                     for values in sorted(closed_klines, key=lambda item: item[1]):
-                        self._append_closed_kline(symbol, *values)
+                        self._observe_rest_closed_kline(symbol, *values)
             except (TimeoutError, aiohttp.ClientError, TypeError, ValueError) as exc:
                 log.warning(
                     "binance.kline_backfill_error",
@@ -633,12 +716,11 @@ class BinanceFuturesCollector:
         taker_buy_base_volume: float,
         taker_buy_quote_volume: float,
     ) -> bool:
-        candle = ClosedKline(
-            symbol=symbol.upper(),
-            timeframe="1m",
+        candle = self._make_closed_kline(
+            symbol=symbol,
             open_time_ms=open_time_ms,
             close_time_ms=close_time_ms,
-            open=open_price,
+            open_price=open_price,
             high=high,
             low=low,
             close=close,
@@ -647,10 +729,69 @@ class BinanceFuturesCollector:
             taker_buy_base_volume=taker_buy_base_volume,
             taker_buy_quote_volume=taker_buy_quote_volume,
         )
-        if not self._valid_closed_kline(candle):
+        if candle is None:
             return False
+        return self._append_authoritative_kline(symbol, candle)
+
+    def _observe_rest_closed_kline(
+        self,
+        symbol: str,
+        open_time_ms: int,
+        close_time_ms: int,
+        open_price: float,
+        high: float,
+        low: float,
+        close: float,
+        base_volume: float,
+        quote_volume: float,
+        taker_buy_base_volume: float,
+        taker_buy_quote_volume: float,
+    ) -> bool:
+        candle = self._make_closed_kline(
+            symbol=symbol.upper(),
+            open_time_ms=open_time_ms,
+            close_time_ms=close_time_ms,
+            open_price=open_price,
+            high=high,
+            low=low,
+            close=close,
+            base_volume=base_volume,
+            quote_volume=quote_volume,
+            taker_buy_base_volume=taker_buy_base_volume,
+            taker_buy_quote_volume=taker_buy_quote_volume,
+        )
+        if candle is None or self._kline_integrity_error[symbol] is not None:
+            return False
+
+        if close_time_ms in self._known_klines[symbol]:
+            return self._append_authoritative_kline(symbol, candle)
+
+        candidates = self._rest_closed_candidates[symbol]
+        previous = candidates.get(close_time_ms)
+        if previous is None or previous[0] != candle:
+            candidates[close_time_ms] = (candle, 1)
+            while len(candidates) > self._kline_buffer_size:
+                candidates.pop(min(candidates))
+            return False
+        confirmations = previous[1] + 1
+        if confirmations < _REST_CONFIRMATIONS_REQUIRED:
+            candidates[close_time_ms] = (candle, confirmations)
+            return False
+        candidates.pop(close_time_ms, None)
+
+        ws_candle = self._ws_closed_candidates[symbol].pop(close_time_ms, None)
+        if ws_candle is not None and ws_candle != candle:
+            log.warning(
+                "binance.closed_bar_revised_before_finality",
+                symbol=symbol.upper(),
+                open_time_ms=open_time_ms,
+            )
+        return self._append_authoritative_kline(symbol, candle)
+
+    def _append_authoritative_kline(self, symbol: str, candle: ClosedKline) -> bool:
         if self._kline_integrity_error[symbol] is not None:
             return False
+        close_time_ms = candle.close_time_ms
         known = self._known_klines[symbol].get(close_time_ms)
         if known is not None:
             if known != candle:
@@ -690,6 +831,36 @@ class BinanceFuturesCollector:
         if not pending:
             self._needs_kline_backfill.discard(symbol)
         return True
+
+    @staticmethod
+    def _make_closed_kline(
+        symbol: str,
+        open_time_ms: int,
+        close_time_ms: int,
+        open_price: float,
+        high: float,
+        low: float,
+        close: float,
+        base_volume: float,
+        quote_volume: float,
+        taker_buy_base_volume: float,
+        taker_buy_quote_volume: float,
+    ) -> ClosedKline | None:
+        candle = ClosedKline(
+            symbol=symbol.upper(),
+            timeframe="1m",
+            open_time_ms=open_time_ms,
+            close_time_ms=close_time_ms,
+            open=open_price,
+            high=high,
+            low=low,
+            close=close,
+            base_volume=base_volume,
+            quote_volume=quote_volume,
+            taker_buy_base_volume=taker_buy_base_volume,
+            taker_buy_quote_volume=taker_buy_quote_volume,
+        )
+        return candle if BinanceFuturesCollector._valid_closed_kline(candle) else None
 
     def _promote_closed_kline(self, symbol: str, candle: ClosedKline) -> None:
         self._closed_klines[symbol].append(candle)

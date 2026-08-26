@@ -71,6 +71,7 @@ class QuantScoutsService:
             reconnect_initial_s=self.settings.ws_reconnect_initial_s,
             reconnect_max_s=self.settings.ws_reconnect_max_s,
             kline_buffer_size=self.settings.price_window,
+            kline_finality_delay_s=self.settings.kline_finality_delay_s,
             max_exchange_future_skew_s=self.settings.maximum_binance_future_skew_ms / 1_000,
         )
         self._last_kline_close_time_ms: dict[str, int] = {}
@@ -417,6 +418,10 @@ class QuantScoutsService:
                 tasks.create_task(self.collector.run())
                 tasks.create_task(
                     self.collector.run_open_interest_loop(self.settings.open_interest_interval_s)
+                )
+                tasks.create_task(
+                    self.collector.run_funding_loop(self.settings.funding_interval_s),
+                    name="binance-funding-rest-fallback",
                 )
                 tasks.create_task(
                     self.collector.run_kline_reconciliation_loop(

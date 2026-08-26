@@ -88,9 +88,29 @@ def _kline_message(
     }
 
 
+def _confirm_kline(service: QuantScoutsService, message: dict) -> bool:
+    service.collector._on_message(message)
+    kline = message["data"]["k"]
+    arguments = (
+        "btcusdt",
+        int(kline["t"]),
+        int(kline["T"]),
+        float(kline["o"]),
+        float(kline["h"]),
+        float(kline["l"]),
+        float(kline["c"]),
+        float(kline["v"]),
+        float(kline["q"]),
+        float(kline["V"]),
+        float(kline["Q"]),
+    )
+    assert not service.collector._observe_rest_closed_kline(*arguments)
+    return service.collector._observe_rest_closed_kline(*arguments)
+
+
 def test_emit_skips_incomplete_order_book():
     service = _service()
-    service.collector._on_message(_kline_message(closed=True))
+    _confirm_kline(service, _kline_message(closed=True))
     service.collector.books["btcusdt"] = {"bids": [(100.0, 1.0)], "asks": []}
 
     asyncio.run(service._emit_once())
@@ -114,15 +134,15 @@ def test_emit_requires_a_closed_kline():
 def test_emit_blocks_entire_symbol_until_gap_is_backfilled():
     service = _service()
     service.collector._wall_clock = lambda: 180.0
-    service.collector._on_message(_kline_message(closed=True, close_time_ms=59_999, close="95"))
-    service.collector._on_message(_kline_message(closed=True, close_time_ms=179_999, close="97"))
+    _confirm_kline(service, _kline_message(closed=True, close_time_ms=59_999, close="95"))
+    _confirm_kline(service, _kline_message(closed=True, close_time_ms=179_999, close="97"))
 
     asyncio.run(service._emit_once())
 
     assert service.bus.messages == []
     assert len(service.collector.pending_closed_klines("btcusdt")) == 1
 
-    service.collector._on_message(_kline_message(closed=True, close_time_ms=119_999, close="96"))
+    _confirm_kline(service, _kline_message(closed=True, close_time_ms=119_999, close="96"))
     asyncio.run(service._emit_once())
 
     assert [topic for topic, _ in service.bus.messages] == [Topics.CLOSED_BAR] * 3
@@ -132,8 +152,8 @@ def test_emit_blocks_entire_symbol_until_gap_is_backfilled():
 def test_emit_blocks_conflicting_final_bar():
     service = _service()
     service.collector._wall_clock = lambda: 120.0
-    service.collector._on_message(_kline_message(closed=True, close="95"))
-    service.collector._on_message(_kline_message(closed=True, close="96"))
+    _confirm_kline(service, _kline_message(closed=True, close="95"))
+    _confirm_kline(service, _kline_message(closed=True, close="96"))
 
     asyncio.run(service._emit_once())
 
@@ -144,7 +164,7 @@ def test_emit_blocks_conflicting_final_bar():
 def test_emit_uses_closed_kline_for_indicators_and_current_book_for_mid_price():
     service = _service()
     service.collector._on_message(_depth_message(bid="100", ask="102"))
-    service.collector._on_message(_kline_message(closed=True, close="95", quote_volume="3000"))
+    _confirm_kline(service, _kline_message(closed=True, close="95", quote_volume="3000"))
     service.collector.open_interest["btcusdt"] = 12345.0
     service.collector.oi_change_pct_1h["btcusdt"] = 2.5
     service.collector._on_message(
@@ -179,7 +199,7 @@ def test_emit_rejects_stale_book_without_losing_closed_kline():
     service = _service()
     service.collector._clock = lambda: now[0]
     service.collector._on_message(_depth_message())
-    service.collector._on_message(_kline_message(closed=True))
+    _confirm_kline(service, _kline_message(closed=True))
     now[0] = 111.0
 
     asyncio.run(service._emit_once())
@@ -194,7 +214,8 @@ def test_emit_rejects_stale_derivatives_even_with_fresh_book_and_kline():
     service.collector._clock = lambda: now[0]
     service.collector._wall_clock = lambda: 180.0
     service.collector._on_message(_depth_message(event_time_ms=180_000))
-    service.collector._on_message(
+    _confirm_kline(
+        service,
         {
             "stream": "btcusdt@kline_1m",
             "data": {
@@ -212,7 +233,7 @@ def test_emit_rejects_stale_derivatives_even_with_fresh_book_and_kline():
                     "Q": "500",
                 }
             },
-        }
+        },
     )
 
     asyncio.run(service._emit_once())
@@ -226,7 +247,8 @@ def test_emit_resumes_after_derivative_observations_are_refreshed():
     service.collector._clock = lambda: now[0]
     service.collector._wall_clock = lambda: 180.0
     service.collector._on_message(_depth_message(event_time_ms=180_000))
-    service.collector._on_message(
+    _confirm_kline(
+        service,
         {
             "stream": "btcusdt@kline_1m",
             "data": {
@@ -244,7 +266,7 @@ def test_emit_resumes_after_derivative_observations_are_refreshed():
                     "Q": "500",
                 }
             },
-        }
+        },
     )
     service.collector._on_message({"stream": "btcusdt@markPrice@1s", "data": {"E": 180_000, "r": "0.0002"}})
     service.collector._open_interest_updated_at["btcusdt"] = now[0]
@@ -258,7 +280,7 @@ def test_emit_keeps_liquidations_when_publish_fails():
     service = _service()
     service.bus = _FailingBus()
     service.collector._on_message(_depth_message())
-    service.collector._on_message(_kline_message(closed=True))
+    _confirm_kline(service, _kline_message(closed=True))
     service.collector._on_message(
         {
             "stream": "btcusdt@forceOrder",
@@ -281,7 +303,7 @@ def test_emit_does_not_clear_liquidations_arriving_during_publish():
     service = _service()
     service.bus = _InjectingBus(service.collector)
     service.collector._on_message(_depth_message())
-    service.collector._on_message(_kline_message(closed=True))
+    _confirm_kline(service, _kline_message(closed=True))
     service.collector._on_message(
         {
             "stream": "btcusdt@forceOrder",
@@ -317,4 +339,4 @@ def test_restore_rebuilds_indicator_window_without_duplicate_publish():
     assert service.collector.pending_closed_klines("btcusdt") == ()
     assert list(service.builder._closes["BTCUSDT"]) == [95.0]
     assert service._last_kline_close_time_ms == {"btcusdt": 59_999}
-    assert not service.collector._on_message(_kline_message(closed=True))
+    assert not _confirm_kline(service, _kline_message(closed=True))

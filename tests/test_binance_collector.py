@@ -6,13 +6,14 @@ import pytest
 from kairos_quant.collectors.binance_ws import BinanceFuturesCollector, ClosedKline
 
 
-def _collector(*, clock=lambda: 100.0, wall_clock=lambda: 1_000.0) -> BinanceFuturesCollector:
+def _collector(*, clock=lambda: 100.0, wall_clock=lambda: 1_000.0, **overrides) -> BinanceFuturesCollector:
     return BinanceFuturesCollector(
         ["BTCUSDT"],
         "wss://example.invalid/stream",
         "https://example.invalid",
         clock=clock,
         wall_clock=wall_clock,
+        **overrides,
     )
 
 
@@ -55,7 +56,8 @@ def test_only_closed_unique_klines_are_buffered():
         },
     }
     collector._on_message(closed_kline)
-    collector._on_message(closed_kline)  # reconnect replay must not duplicate a candle
+    assert _confirm_rest_kline(collector, closed_kline)
+    assert not _confirm_rest_kline(collector, closed_kline)
 
     klines = collector.drain_closed_klines("BTCUSDT")
     assert [(item.close_time_ms, item.high, item.low, item.close, item.quote_volume) for item in klines] == [
@@ -102,26 +104,25 @@ def test_market_data_freshness_uses_receive_time():
             "data": {"E": 60_000, "u": 1, "b": [["100", "2"]], "a": [["101", "3"]]},
         }
     )
-    collector._on_message(
-        {
-            "stream": "btcusdt@kline_1m",
-            "data": {
-                "k": {
-                    "x": True,
-                    "t": 0,
-                    "T": 59_999,
-                    "o": "100",
-                    "h": "101",
-                    "l": "99",
-                    "c": "100.5",
-                    "v": "10",
-                    "q": "1000",
-                    "V": "5",
-                    "Q": "500",
-                }
-            },
-        }
-    )
+    closed_kline = {
+        "stream": "btcusdt@kline_1m",
+        "data": {
+            "k": {
+                "x": True,
+                "t": 0,
+                "T": 59_999,
+                "o": "100",
+                "h": "101",
+                "l": "99",
+                "c": "100.5",
+                "v": "10",
+                "q": "1000",
+                "V": "5",
+                "Q": "500",
+            }
+        },
+    }
+    assert _confirm_rest_kline(collector, closed_kline)
 
     assert collector.is_book_fresh("btcusdt", 10)
     assert collector.is_kline_fresh("btcusdt", 90)
@@ -238,6 +239,7 @@ def test_kline_backfill_excludes_open_candle_and_deduplicates_stream_replay():
     collector = _collector(wall_clock=lambda: 4_600.0)
 
     asyncio.run(collector.refresh_klines(_KlineSession()))
+    asyncio.run(collector.refresh_klines(_KlineSession()))
     collector._on_message(
         {
             "stream": "btcusdt@kline_1m",
@@ -286,18 +288,37 @@ def _closed_kline(close_time_ms: int, *, close: str = "100", quote_volume: str =
     }
 
 
+def _confirm_rest_kline(collector: BinanceFuturesCollector, message: dict) -> bool:
+    kline = message["data"]["k"]
+    arguments = (
+        "btcusdt",
+        int(kline["t"]),
+        int(kline["T"]),
+        float(kline["o"]),
+        float(kline["h"]),
+        float(kline["l"]),
+        float(kline["c"]),
+        float(kline["v"]),
+        float(kline["q"]),
+        float(kline["V"]),
+        float(kline["Q"]),
+    )
+    assert not collector._observe_rest_closed_kline(*arguments)
+    return collector._observe_rest_closed_kline(*arguments)
+
+
 def test_gap_is_held_until_missing_candle_arrives_then_emitted_in_order():
     wall_now = [180.0]
     collector = _collector(wall_clock=lambda: wall_now[0])
-    collector._on_message(_closed_kline(59_999, close="100"))
-    collector._on_message(_closed_kline(179_999, close="102"))
+    assert _confirm_rest_kline(collector, _closed_kline(59_999, close="100"))
+    assert _confirm_rest_kline(collector, _closed_kline(179_999, close="102"))
 
     assert [item.close_time_ms for item in collector.drain_closed_klines("btcusdt")] == [59_999]
     assert "btcusdt" in collector._needs_kline_backfill
     assert not collector.is_kline_stream_safe("btcusdt")
     assert collector.kline_integrity_reason("btcusdt") == "gap_waiting_for_backfill"
 
-    collector._on_message(_closed_kline(119_999, close="101"))
+    assert _confirm_rest_kline(collector, _closed_kline(119_999, close="101"))
 
     assert [item.close_time_ms for item in collector.drain_closed_klines("btcusdt")] == [
         119_999,
@@ -309,9 +330,9 @@ def test_gap_is_held_until_missing_candle_arrives_then_emitted_in_order():
 
 def test_conflicting_closed_bar_permanently_blocks_strategy_stream():
     collector = _collector(wall_clock=lambda: 120.0)
-    assert collector._on_message(_closed_kline(59_999, close="100"))
+    assert _confirm_rest_kline(collector, _closed_kline(59_999, close="100"))
 
-    assert not collector._on_message(_closed_kline(59_999, close="101"))
+    assert not _confirm_rest_kline(collector, _closed_kline(59_999, close="101"))
 
     assert not collector.is_kline_stream_safe("btcusdt")
     assert collector.kline_integrity_reason("btcusdt") == "conflicting_closed_bar"
@@ -319,9 +340,9 @@ def test_conflicting_closed_bar_permanently_blocks_strategy_stream():
 
 def test_unknown_reordered_bar_blocks_strategy_stream():
     collector = _collector(wall_clock=lambda: 180.0)
-    assert collector._on_message(_closed_kline(119_999, close="101"))
+    assert _confirm_rest_kline(collector, _closed_kline(119_999, close="101"))
 
-    assert not collector._on_message(_closed_kline(59_999, close="100"))
+    assert not _confirm_rest_kline(collector, _closed_kline(59_999, close="100"))
 
     assert not collector.is_kline_stream_safe("btcusdt")
     assert collector.kline_integrity_reason("btcusdt") == "reordered_closed_bar"
@@ -329,7 +350,7 @@ def test_unknown_reordered_bar_blocks_strategy_stream():
 
 def test_pending_bars_are_acknowledged_only_after_publish():
     collector = _collector(wall_clock=lambda: 120.0)
-    assert collector._on_message(_closed_kline(59_999))
+    assert _confirm_rest_kline(collector, _closed_kline(59_999))
 
     assert [bar.close_time_ms for bar in collector.pending_closed_klines("BTCUSDT")] == [59_999]
     collector.acknowledge_closed_klines("btcusdt", 1)
@@ -358,9 +379,9 @@ def test_restored_producer_state_is_not_republished_and_detects_revision():
 
     assert collector.restore_closed_kline(restored)
     assert collector.pending_closed_klines("btcusdt") == ()
-    assert not collector._on_message(_closed_kline(59_999, close="99"))
+    assert not _confirm_rest_kline(collector, _closed_kline(59_999, close="99"))
     assert collector.is_kline_stream_safe("btcusdt")
-    assert collector._on_message(_closed_kline(179_999, close="102"))
+    assert _confirm_rest_kline(collector, _closed_kline(179_999, close="102"))
     assert [bar.close_time_ms for bar in collector.pending_closed_klines("btcusdt")] == [179_999]
 
     revised = replace(restored, quote_volume=1_001.0)
@@ -368,15 +389,33 @@ def test_restored_producer_state_is_not_republished_and_detects_revision():
     assert collector.kline_integrity_reason("btcusdt") == "conflicting_closed_bar"
 
 
+def test_provisional_websocket_revision_does_not_block_and_rest_owns_finality():
+    collector = _collector(wall_clock=lambda: 120.0)
+    websocket_first = _closed_kline(59_999, close="100")
+    websocket_revised = _closed_kline(59_999, close="101")
+
+    assert collector._on_message(websocket_first)
+    assert collector._on_message(websocket_revised)
+    assert collector.pending_closed_klines("btcusdt") == ()
+    assert collector.is_kline_stream_safe("btcusdt")
+
+    assert not collector._observe_rest_closed_kline(
+        "btcusdt", 0, 59_999, 100.0, 101.0, 99.0, 100.0, 10.0, 1_000.0, 5.0, 500.0
+    )
+    assert _confirm_rest_kline(collector, websocket_revised)
+    assert [bar.close for bar in collector.pending_closed_klines("btcusdt")] == [101.0]
+    assert collector.is_kline_stream_safe("btcusdt")
+
+
 def test_duplicate_final_candle_does_not_extend_freshness():
     now = [100.0]
     wall_now = [60.0]
     collector = _collector(clock=lambda: now[0], wall_clock=lambda: wall_now[0])
     message = _closed_kline(59_999)
-    assert collector._on_message(message)
+    assert _confirm_rest_kline(collector, message)
     now[0] = 111.0
     wall_now[0] = 71.0
-    assert not collector._on_message(message)
+    assert not _confirm_rest_kline(collector, message)
 
     assert not collector.is_kline_fresh("btcusdt", 10)
 
@@ -470,6 +509,44 @@ def test_funding_freshness_requires_a_valid_observation():
 
     assert collector._on_message({"stream": "btcusdt@markPrice@1s", "data": {"E": 1_000_000, "r": "0"}})
     assert collector.is_funding_fresh("btcusdt", 10)
+
+
+class _FundingResponse:
+    status = 200
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return None
+
+    async def json(self):
+        return [
+            {"symbol": "BTCUSDT", "lastFundingRate": "0.0002", "time": 1_000_000},
+            {"symbol": "UNCONFIGURED", "lastFundingRate": "0.9", "time": 1_000_000},
+        ]
+
+
+class _FundingSession:
+    def get(self, url):
+        assert url == "https://example.invalid/fapi/v1/premiumIndex"
+        return _FundingResponse()
+
+
+def test_rest_funding_fallback_refreshes_the_configured_universe():
+    collector = _collector()
+
+    asyncio.run(collector.refresh_funding(_FundingSession()))
+
+    assert collector.funding["btcusdt"] == pytest.approx(0.0002)
+    assert collector.is_funding_fresh("btcusdt", 10)
+
+
+def test_funding_loop_rejects_nonpositive_interval():
+    collector = _collector()
+
+    with pytest.raises(ValueError, match="funding interval"):
+        asyncio.run(collector.run_funding_loop(0))
 
 
 def test_exchange_freshness_tolerates_only_the_bounded_future_skew():
@@ -585,7 +662,7 @@ class _BoundaryResponse(_KlineResponse):
         self.wall_now = wall_now
 
     async def json(self):
-        self.wall_now[0] = 60.1
+        self.wall_now[0] = max(self.wall_now[0], 60.1)
         return [
             [0, "99", "101", "99", "100", "1", 59_999, "1000", 1, "0.5", "500"],
             [60_000, "100", "102", "100", "101", "1", 119_999, "1000", 1, "0.5", "500"],
@@ -604,6 +681,11 @@ def test_backfill_uses_post_response_time_at_minute_boundary():
     wall_now = [59.5]
     collector = _collector(wall_clock=lambda: wall_now[0])
 
+    asyncio.run(collector.refresh_klines(_BoundarySession(wall_now)))
+    assert collector.drain_closed_klines("btcusdt") == []
+
+    wall_now[0] = 65.1
+    asyncio.run(collector.refresh_klines(_BoundarySession(wall_now)))
     asyncio.run(collector.refresh_klines(_BoundarySession(wall_now)))
 
     assert [item.close_time_ms for item in collector.drain_closed_klines("btcusdt")] == [59_999]

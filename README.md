@@ -23,19 +23,23 @@ candle window evicts old rows, so live values remain consistent with an unbounde
 The development collector consumes Binance USD-M Futures combined streams:
 
 - `depth10@100ms` for the top of book;
-- `markPrice@1s` for funding;
-- `kline_1m` for closed indicator candles and quote volume;
+- `markPrice@1s` when available, with `premiumIndex` REST fallback for funding;
+- `kline_1m` as provisional close/liveness evidence;
 - `forceOrder` for liquidation notional.
 
 Open interest value and its one-hour change are refreshed periodically from Binance's
-5-minute statistics. Closed candles are backfilled over REST on startup and reconnect,
-then deduplicated against the WebSocket stream. Each accepted close is emitted as a
+5-minute statistics. A Binance WebSocket candle marked `x=true` can still be revised,
+so it is never authoritative strategy input. Closed candles are continuously read from
+REST after a bounded finality delay and require two byte-identical observations before
+promotion. The latest retained REST window is also reconciled after publication, so a
+later price or volume mutation permanently blocks only that symbol. Each accepted close is emitted as a
 strict `ClosedBarEventV1` containing the complete OHLCV, quote-volume and taker-buy
 volumes before it is acknowledged locally. A gap pauses that symbol until REST backfill
 repairs the exact sequence; a reordered or conflicting close fails the stream closed.
 Connections use bounded exponential
 backoff, and snapshots are suppressed when their book or last closed kline is stale.
-Funding and open interest must also have fresh successful observations; the OI series
+Funding and open interest must also have fresh successful observations; funding falls
+back to the official public REST snapshot when its WebSocket stream is unavailable. The OI series
 must be a contiguous 13-point five-minute grid and its last source point cannot be stale. Kline freshness
 checks both receipt time and the exchange close timestamp, so a newly received historical
 backfill cannot masquerade as current data.
