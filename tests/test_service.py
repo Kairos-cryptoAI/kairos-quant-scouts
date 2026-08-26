@@ -292,3 +292,29 @@ def test_emit_does_not_clear_liquidations_arriving_during_publish():
     asyncio.run(service._emit_once())
 
     assert service.collector.liquidation_totals("btcusdt").long_usd == 50.0
+
+
+def test_restore_rebuilds_indicator_window_without_duplicate_publish():
+    service = _service()
+    event = ClosedBarEventV1(
+        source=service.settings.service_name,
+        symbol="BTCUSDT",
+        timeframe="1m",
+        open_time_ms=0,
+        close_time_ms=59_999,
+        open=95.0,
+        high=100.0,
+        low=90.0,
+        close=95.0,
+        base_volume=25.0,
+        quote_volume=2_500.0,
+        taker_buy_base_volume=10.0,
+        taker_buy_quote_volume=1_000.0,
+    )
+
+    service._restore_closed_bar_payloads([event.model_dump(mode="json")])
+
+    assert service.collector.pending_closed_klines("btcusdt") == ()
+    assert list(service.builder._closes["BTCUSDT"]) == [95.0]
+    assert service._last_kline_close_time_ms == {"btcusdt": 59_999}
+    assert not service.collector._on_message(_kline_message(closed=True))

@@ -22,6 +22,7 @@ class QuantSettings(CoreSettings):
     depth_levels: int = Field(default=10, gt=0)
     price_window: int = Field(default=200, ge=MACD_MIN_SAMPLES)
     open_interest_interval_s: float = Field(default=60.0, gt=0)
+    kline_reconciliation_interval_s: float = Field(default=60.0, gt=0)
     book_stale_after_s: float = Field(default=10.0, gt=0)
     kline_stale_after_s: float = Field(default=90.0, gt=0)
     derivatives_stale_after_s: float = Field(default=180.0, gt=0)

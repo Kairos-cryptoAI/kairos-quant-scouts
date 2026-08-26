@@ -1,8 +1,9 @@
 import asyncio
+from dataclasses import replace
 
 import pytest
 
-from kairos_quant.collectors.binance_ws import BinanceFuturesCollector
+from kairos_quant.collectors.binance_ws import BinanceFuturesCollector, ClosedKline
 
 
 def _collector(*, clock=lambda: 100.0, wall_clock=lambda: 1_000.0) -> BinanceFuturesCollector:
@@ -336,6 +337,35 @@ def test_pending_bars_are_acknowledged_only_after_publish():
     assert collector.pending_closed_klines("btcusdt") == ()
     with pytest.raises(ValueError, match="exceeds"):
         collector.acknowledge_closed_klines("btcusdt", 1)
+
+
+def test_restored_producer_state_is_not_republished_and_detects_revision():
+    collector = _collector(wall_clock=lambda: 180.0)
+    restored = ClosedKline(
+        symbol="BTCUSDT",
+        timeframe="1m",
+        open_time_ms=60_000,
+        close_time_ms=119_999,
+        open=100.0,
+        high=102.0,
+        low=99.0,
+        close=101.0,
+        base_volume=10.0,
+        quote_volume=1_000.0,
+        taker_buy_base_volume=5.0,
+        taker_buy_quote_volume=500.0,
+    )
+
+    assert collector.restore_closed_kline(restored)
+    assert collector.pending_closed_klines("btcusdt") == ()
+    assert not collector._on_message(_closed_kline(59_999, close="99"))
+    assert collector.is_kline_stream_safe("btcusdt")
+    assert collector._on_message(_closed_kline(179_999, close="102"))
+    assert [bar.close_time_ms for bar in collector.pending_closed_klines("btcusdt")] == [179_999]
+
+    revised = replace(restored, quote_volume=1_001.0)
+    assert not collector.restore_closed_kline(revised)
+    assert collector.kline_integrity_reason("btcusdt") == "conflicting_closed_bar"
 
 
 def test_duplicate_final_candle_does_not_extend_freshness():

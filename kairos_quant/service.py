@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import time
+from collections.abc import Iterable, Mapping
 from dataclasses import asdict
+from typing import Any
 
 import aiohttp
 from kairos_core.bus import build_bus
@@ -14,7 +17,7 @@ from kairos_core.logging import configure_logging, get_logger
 from kairos_core.topics import Topics
 from kairos_persistence import DurableMessageBus
 
-from .collectors import BinanceFuturesCollector
+from .collectors import BinanceFuturesCollector, ClosedKline
 from .config import QuantSettings
 from .runtime_venue_gate import (
     VenueGatePolicy,
@@ -103,6 +106,78 @@ class QuantScoutsService:
         )
         self._venue_monotonic = time.monotonic
         self._venue_wall_clock_ms = lambda: int(time.time() * 1_000)
+
+    def _restore_closed_bar_payloads(self, payloads: Iterable[object]) -> None:
+        """Restore the producer's last immutable window without republishing it."""
+
+        for raw_payload in payloads:
+            payload: Any = raw_payload
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            if not isinstance(payload, Mapping):
+                raise TypeError("event_audit closed-bar payload must be a JSON object")
+            event = ClosedBarEventV1.model_validate(dict(payload))
+            if event.symbol.upper() not in {symbol.upper() for symbol in self.settings.symbols}:
+                continue
+            candle = ClosedKline(
+                symbol=event.symbol,
+                timeframe=event.timeframe,
+                open_time_ms=event.open_time_ms,
+                close_time_ms=event.close_time_ms,
+                open=event.open,
+                high=event.high,
+                low=event.low,
+                close=event.close,
+                base_volume=event.base_volume,
+                quote_volume=event.quote_volume,
+                taker_buy_base_volume=event.taker_buy_base_volume,
+                taker_buy_quote_volume=event.taker_buy_quote_volume,
+            )
+            if self.collector.restore_closed_kline(candle):
+                self.builder.push_candle(
+                    event.symbol.upper(), high=event.high, low=event.low, close=event.close
+                )
+                self._last_kline_close_time_ms[event.symbol.lower()] = event.close_time_ms
+
+    async def _restore_closed_bars(self) -> None:
+        if not isinstance(self.bus, DurableMessageBus):
+            return
+        await self.bus.start()
+        if self.bus.repository is None:  # defensive: start() establishes it
+            raise RuntimeError("durable quant bus has no audit repository")
+        rows = await self.bus.repository.pool.fetch(
+            """SELECT payload
+                 FROM (
+                     SELECT payload,
+                            produced_at,
+                            row_number() OVER (
+                                PARTITION BY payload->>'symbol'
+                                ORDER BY (payload->>'open_time_ms')::bigint DESC, produced_at DESC
+                            ) AS row_number
+                       FROM event_audit
+                      WHERE topic=$1
+                        AND source=$2
+                        AND payload->>'venue'='BINANCE_UM'
+                 ) AS ranked
+                WHERE row_number <= $3
+                ORDER BY payload->>'symbol',
+                         (payload->>'open_time_ms')::bigint,
+                         produced_at""",
+            Topics.CLOSED_BAR,
+            self.settings.service_name,
+            self.settings.price_window,
+        )
+        self._restore_closed_bar_payloads(row["payload"] for row in rows)
+        log.info(
+            "closed_bar.producer_state_restored",
+            symbols=len(self._last_kline_close_time_ms),
+            bars=sum(len(values) for values in self.collector._known_klines.values()),
+            blocked_symbols=sorted(
+                symbol.upper()
+                for symbol in self.collector.symbols
+                if not self.collector.is_kline_stream_safe(symbol)
+            ),
+        )
 
     async def _emit_loop(self) -> None:
         while True:
@@ -334,13 +409,25 @@ class QuantScoutsService:
         configure_logging(
             self.settings.log_level, json_logs=self.settings.log_json, service=self.settings.service_name
         )
+        await self._restore_closed_bars()
         log.info("quant.start", symbols=self.settings.symbols)
-        async with asyncio.TaskGroup() as tasks:
-            tasks.create_task(self.collector.run())
-            tasks.create_task(self.collector.run_open_interest_loop(self.settings.open_interest_interval_s))
-            tasks.create_task(self._emit_loop())
-            if self.settings.enable_venue_quality_gate:
-                tasks.create_task(self._venue_quality_loop(), name="evedex-dev-venue-quality")
+        try:
+            async with asyncio.TaskGroup() as tasks:
+                tasks.create_task(self.collector.run())
+                tasks.create_task(
+                    self.collector.run_open_interest_loop(self.settings.open_interest_interval_s)
+                )
+                tasks.create_task(
+                    self.collector.run_kline_reconciliation_loop(
+                        self.settings.kline_reconciliation_interval_s
+                    ),
+                    name="binance-kline-reconciliation",
+                )
+                tasks.create_task(self._emit_loop())
+                if self.settings.enable_venue_quality_gate:
+                    tasks.create_task(self._venue_quality_loop(), name="evedex-dev-venue-quality")
+        finally:
+            await self.bus.close()
 
 
 def main() -> None:  # pragma: no cover

@@ -1,3 +1,3 @@
-from .binance_ws import BinanceFuturesCollector
+from .binance_ws import BinanceFuturesCollector, ClosedKline
 
-__all__ = ["BinanceFuturesCollector"]
+__all__ = ["BinanceFuturesCollector", "ClosedKline"]
