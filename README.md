@@ -1,5 +1,29 @@
 # kairos-quant-scouts
 
+## Offline long-gap recovery
+
+For an outage beyond the live collector's bounded REST window, use the deploy
+long-gap recovery wrapper in the isolated `kairos-paper-gate` project. Stop the
+old quant producer and strategy/risk/execution consumers first; preserve a fresh
+PostgreSQL backup. The module `kairos_quant.long_gap_recovery` requires an
+explicit closed end boundary, a total bar budget (at most 150,000) and offline
+consumer confirmation. It accepts only the five-symbol PAPER Redis profile and
+the official Binance UM URL. No trading credentials or LLM/feed APIs are used.
+
+Each page includes the persisted anchor, requires two identical full REST
+responses, and publishes only a contiguous verified suffix via the existing
+atomic event-audit/outbox path. Resume reads the durable audit prefix, never an
+uncommitted memory cursor. Conflicting history/anchors, missing/reordered bars,
+non-finite values, request errors or exhausted bounds stop the operation.
+Structured logs expose retrieval time, coverage and stop reason, not PnL.
+
+Live quant and offline recovery share an exclusive PostgreSQL advisory lease.
+Do not run older images without this lease alongside recovery. After repair,
+validate per-symbol continuity and restore the stopped read-only consumers;
+do not delete Redis entries, inbox cursors, audit history or old backups.
+Historical restoration does not count as continuous online observation or a
+fresh 24-hour DEV qualification window.
+
 **Layer 1A — Quant Scouts.** Pure-math collectors and indicators (no LLM). They
 connect to the exchange, digest raw order-book and derivatives streams, and emit a
 compact `MarketSnapshot` — the only numeric payload the upper layers consume.

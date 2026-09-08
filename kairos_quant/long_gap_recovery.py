@@ -1,0 +1,219 @@
+"""Explicit, offline PAPER bar repair through the existing durable publish path.
+
+Run only with strategy/risk/execution consumers stopped. No venue mutation or
+paid API exists here. Restart resumes from committed event_audit, not RAM.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import time
+from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
+from typing import Any
+
+import aiohttp
+from kairos_core.bus import build_bus
+from kairos_core.contracts import ClosedBarEventV1
+from kairos_core.topics import Topics
+from kairos_persistence import DurableMessageBus
+
+from .config import QuantSettings
+from .producer_lease import producer_lease
+
+MINUTE = 60_000
+SOURCE = "kairos-quant-scouts"
+SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT")
+FetchPage = Callable[[str, int, int], Awaitable[object]]
+Publish = Callable[[ClosedBarEventV1], Awaitable[None]]
+
+
+class RecoveryError(ValueError):
+    """Safe operational reason that contains no payload or secret values."""
+
+
+def parse_page(raw: object, *, symbol: str, start: int, end: int) -> tuple[ClosedBarEventV1, ...]:
+    if not isinstance(raw, list) or len(raw) != (end - start) // MINUTE:
+        raise RecoveryError("recovery REST page is incomplete")
+    result = []
+    for index, row in enumerate(raw):
+        if not isinstance(row, list) or len(row) < 11:
+            raise RecoveryError("recovery REST row is malformed")
+        if type(row[0]) is not int or type(row[6]) is not int or row[0] != start + index * MINUTE:
+            raise RecoveryError("recovery bars are duplicate, reordered or gapped")
+        numeric = (row[1], row[2], row[3], row[4], row[5], row[7], row[9], row[10])
+        if any(isinstance(value, bool) for value in numeric):
+            raise RecoveryError("boolean bar values are invalid")
+        result.append(
+            ClosedBarEventV1(
+                source=SOURCE,
+                symbol=symbol,
+                open_time_ms=row[0],
+                close_time_ms=row[6],
+                open=float(row[1]),
+                high=float(row[2]),
+                low=float(row[3]),
+                close=float(row[4]),
+                base_volume=float(row[5]),
+                quote_volume=float(row[7]),
+                taker_buy_base_volume=float(row[9]),
+                taker_buy_quote_volume=float(row[10]),
+            )
+        )
+    return tuple(result)
+
+
+async def recover_symbol(
+    anchor: ClosedBarEventV1,
+    *,
+    end_exclusive: int,
+    fetch: FetchPage,
+    publish: Publish,
+    page_size: int = 200,
+    pause: Callable[[], Awaitable[None]],
+    progress: Callable[[dict[str, Any]], None],
+) -> int:
+    if not 2 <= page_size <= 200 or end_exclusive % MINUTE or end_exclusive <= anchor.open_time_ms:
+        raise RecoveryError("invalid bounded recovery interval")
+    appended = 0
+    current = anchor
+    while current.close_time_ms + 1 < end_exclusive:
+        start = current.open_time_ms
+        end = min(end_exclusive, start + page_size * MINUTE)
+        first = parse_page(
+            await fetch(current.symbol, start, end), symbol=current.symbol, start=start, end=end
+        )
+        await pause()
+        second = parse_page(
+            await fetch(current.symbol, start, end), symbol=current.symbol, start=start, end=end
+        )
+        if first != second or first[0].canonical_bar_bytes() != current.canonical_bar_bytes():
+            raise RecoveryError("recovery REST confirmation or persisted anchor conflict")
+        # Validate the entire page before publishing any row. Every publish
+        # atomically inserts event_audit and outbox; no ACK/cursor can outrun it.
+        for event in first[1:]:
+            await publish(event)
+            current = event
+            appended += 1
+        progress(
+            {
+                "symbol": current.symbol,
+                "through_exclusive_ms": current.close_time_ms + 1,
+                "appended_bars": appended,
+                "retrieved_at_utc": datetime.now(UTC).isoformat(),
+            }
+        )
+    return appended
+
+
+async def load_anchor(bus: DurableMessageBus, symbol: str) -> ClosedBarEventV1:
+    if bus.repository is None:
+        raise RuntimeError("recovery repository unavailable")
+    # Validate the persisted timeline without reading strategy/trade performance.
+    rows = await bus.repository.pool.fetch(
+        """SELECT payload FROM event_audit WHERE topic=$1 AND source=$2
+             AND payload->>'symbol'=$3 AND payload->>'venue'='BINANCE_UM'
+             ORDER BY (payload->>'open_time_ms')::bigint""",
+        Topics.CLOSED_BAR,
+        SOURCE,
+        symbol,
+    )
+    previous = None
+    for record in rows:
+        raw = record["payload"]
+        event = ClosedBarEventV1.model_validate(json.loads(raw) if isinstance(raw, str) else raw)
+        if previous is not None and event.open_time_ms != previous.close_time_ms + 1:
+            raise RecoveryError("persisted producer history is not a unique contiguous prefix")
+        previous = event
+    if previous is None:
+        raise RecoveryError("recovery requires an existing authoritative anchor for every symbol")
+    return previous
+
+
+async def run_recovery(end_exclusive: int, maximum_bars: int) -> None:
+    settings = QuantSettings()
+    if (
+        settings.environment != "paper"
+        or settings.bus_backend != "redis"
+        or settings.service_name != SOURCE
+        or set(settings.symbols) != set(SYMBOLS)
+        or settings.binance_rest_base != "https://fapi.binance.com"
+    ):
+        raise RecoveryError("recovery requires the isolated PAPER five-symbol producer profile")
+    finality_ms = max(5_000, int(settings.kline_finality_delay_s * 1_000))
+    if (
+        end_exclusive % MINUTE
+        or end_exclusive > int(time.time() * 1_000) - finality_ms
+        or not 1 <= maximum_bars <= 150_000
+    ):
+        raise RecoveryError("recovery deadline must be closed and budget at most 150000 bars")
+    bus = DurableMessageBus(build_bus(settings), service_name=SOURCE)
+    try:
+        async with producer_lease(bus):
+            anchors = [await load_anchor(bus, symbol) for symbol in SYMBOLS]
+            if any(anchor.close_time_ms + 1 > end_exclusive for anchor in anchors):
+                raise RecoveryError("recovery deadline precedes committed history")
+            required = sum((end_exclusive - anchor.close_time_ms - 1) // MINUTE for anchor in anchors)
+            if required > maximum_bars:
+                raise RecoveryError("recovery exceeds its explicit bar budget")
+            print(
+                json.dumps(
+                    {"state": "STARTED", "bars_required": required, "end_exclusive_ms": end_exclusive}
+                ),
+                flush=True,
+            )
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+
+                async def fetch(symbol: str, start: int, end: int) -> object:
+                    async with session.get(
+                        settings.binance_rest_base + "/fapi/v1/klines",
+                        params={
+                            "symbol": symbol,
+                            "interval": "1m",
+                            "startTime": start,
+                            "endTime": end - 1,
+                            "limit": (end - start) // MINUTE,
+                        },
+                    ) as response:
+                        response.raise_for_status()
+                        return await response.json()
+
+                async def publish(event: ClosedBarEventV1) -> None:
+                    await bus.publish(Topics.CLOSED_BAR, event)
+
+                async def pause() -> None:
+                    await asyncio.sleep(max(1.0, settings.kline_finality_delay_s))
+
+                for anchor in anchors:
+                    await recover_symbol(
+                        anchor,
+                        end_exclusive=end_exclusive,
+                        fetch=fetch,
+                        publish=publish,
+                        pause=pause,
+                        progress=lambda item: print(json.dumps(item), flush=True),
+                    )
+            print(json.dumps({"state": "COMPLETED", "end_exclusive_ms": end_exclusive}), flush=True)
+    finally:
+        await bus.close()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--end-exclusive-ms", type=int, required=True)
+    parser.add_argument("--maximum-bars", type=int, required=True)
+    parser.add_argument("--offline-consumers-confirmed", action="store_true", required=True)
+    args = parser.parse_args()
+    try:
+        asyncio.run(run_recovery(args.end_exclusive_ms, args.maximum_bars))
+    except Exception as exc:
+        # Do not echo connection strings from infrastructure exceptions.
+        reason = str(exc) if isinstance(exc, RecoveryError) else "inspect failed phase; payload withheld"
+        print(json.dumps({"state": "FAILED", "error_type": type(exc).__name__, "reason": reason}), flush=True)
+        raise SystemExit(1) from None
+
+
+if __name__ == "__main__":
+    main()

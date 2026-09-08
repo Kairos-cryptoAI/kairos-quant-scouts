@@ -19,6 +19,7 @@ from kairos_persistence import DurableMessageBus
 
 from .collectors import BinanceFuturesCollector, ClosedKline
 from .config import QuantSettings
+from .producer_lease import producer_lease
 from .runtime_venue_gate import (
     VenueGatePolicy,
     evedex_dev_symbol,
@@ -411,29 +412,29 @@ class QuantScoutsService:
         configure_logging(
             self.settings.log_level, json_logs=self.settings.log_json, service=self.settings.service_name
         )
-        await self._restore_closed_bars()
-        log.info("quant.start", symbols=self.settings.symbols)
         try:
-            async with asyncio.TaskGroup() as tasks:
-                tasks.create_task(self.collector.run())
-                tasks.create_task(
-                    self.collector.run_open_interest_loop(self.settings.open_interest_interval_s)
-                )
-                tasks.create_task(
-                    self.collector.run_funding_loop(self.settings.funding_interval_s),
-                    name="binance-funding-rest-fallback",
-                )
-                tasks.create_task(
-                    self.collector.run_kline_reconciliation_loop(
-                        self.settings.kline_reconciliation_interval_s
-                    ),
-                    name="binance-kline-reconciliation",
-                )
-                tasks.create_task(self._emit_loop())
-                if self.settings.enable_venue_quality_gate:
-                    tasks.create_task(self._venue_quality_loop(), name="evedex-dev-venue-quality")
+            async with producer_lease(self.bus):
+                await self._run_producer()
         finally:
             await self.bus.close()
+
+    async def _run_producer(self) -> None:  # pragma: no cover - requires network
+        await self._restore_closed_bars()
+        log.info("quant.start", symbols=self.settings.symbols)
+        async with asyncio.TaskGroup() as tasks:
+            tasks.create_task(self.collector.run())
+            tasks.create_task(self.collector.run_open_interest_loop(self.settings.open_interest_interval_s))
+            tasks.create_task(
+                self.collector.run_funding_loop(self.settings.funding_interval_s),
+                name="binance-funding-rest-fallback",
+            )
+            tasks.create_task(
+                self.collector.run_kline_reconciliation_loop(self.settings.kline_reconciliation_interval_s),
+                name="binance-kline-reconciliation",
+            )
+            tasks.create_task(self._emit_loop())
+            if self.settings.enable_venue_quality_gate:
+                tasks.create_task(self._venue_quality_loop(), name="evedex-dev-venue-quality")
 
 
 def main() -> None:  # pragma: no cover
