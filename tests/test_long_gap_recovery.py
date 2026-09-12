@@ -3,6 +3,7 @@
 import asyncio
 import json
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
@@ -24,6 +25,33 @@ def anchor(t=0):
 
 async def no_pause():
     return None
+
+
+def test_failure_observation_time_is_not_the_last_confirmed_progress_time(monkeypatch):
+    times = iter(
+        [
+            datetime(2026, 9, 12, 13, 52, 14, tzinfo=UTC),
+            datetime(2026, 9, 12, 13, 53, 4, tzinfo=UTC),
+        ]
+    )
+
+    class Clock:
+        @staticmethod
+        def now(tz):
+            assert tz is UTC
+            return next(times)
+
+    monkeypatch.setattr(recovery, "datetime", Clock)
+    messages = []
+    status = recovery.RecoveryStatus(messages.append)
+    status.confirmed(anchor(), appended=True)
+    status.enter("DURABLE_PUBLISH", symbol="BTCUSDT", start=MINUTE, end=2 * MINUTE)
+    status.failed(TimeoutError("secret://unknown-commit"))
+    assert messages[0]["last_progress_at_utc"] == "2026-09-12T13:52:14+00:00"
+    assert messages[0]["observed_at_utc"] == "2026-09-12T13:53:04+00:00"
+    assert messages[0]["publish_outcome"] == "UNKNOWN"
+    assert messages[0]["confirmed_through_exclusive_ms"] == {"BTCUSDT": MINUTE}
+    assert "secret://" not in json.dumps(messages)
 
 
 def test_many_pages_keep_every_bar_and_match_contract_ids():

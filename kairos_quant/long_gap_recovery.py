@@ -65,6 +65,7 @@ class RecoveryStatus:
         self.emit(
             {
                 "state": state,
+                "observed_at_utc": datetime.now(UTC).isoformat(),
                 "phase": self.phase,
                 "symbol": self.symbol,
                 "window_start_ms": self.window_start_ms,
