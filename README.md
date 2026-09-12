@@ -44,12 +44,27 @@ candle window evicts old rows, so live values remain consistent with an unbounde
 
 ## Data source
 
-The development collector consumes Binance USD-M Futures combined streams:
+The development collector uses two independent Binance USD-M Futures combined
+connections, as specified in Binance's
+[routing notice](https://developers.binance.com/en/docs/products/derivatives-trading-usds-futures/websocket-market-streams/Important-WebSocket-Change-Notice):
 
-- `depth10@100ms` for the top of book;
-- `markPrice@1s` when available, with `premiumIndex` REST fallback for funding;
-- `kline_1m` as provisional close/liveness evidence;
-- `forceOrder` for liquidation notional.
+- `/public/stream`: `depth10@100ms` for the top of book;
+- `/market/stream`: `markPrice@1s` (with `premiumIndex` REST fallback for funding),
+  `kline_1m` as provisional close/liveness evidence, and `forceOrder`.
+
+`KAIROS_BINANCE_WS_BASE` defaults to `wss://fstream.binance.com`. An existing
+`.../stream` configuration is normalized to the root; no mixed/unrouted socket
+is dialed and no legacy network fallback exists. Embedded routes, subscriptions
+or credentials are startup errors. Each worker reconnects independently;
+structured cancellation/fatal errors close both sessions. Only the market worker
+waits for REST reconciliation, so it cannot block public depth processing.
+Public disconnect immediately invalidates the old book; reconnect alone or a
+replayed update ID cannot refresh it. Only exact subscribed streams belonging
+to that worker are accepted; diff-depth is not treated as a top-N snapshot.
+
+`forceOrder` is a sampled liquidation snapshot stream, not a complete event tape:
+its totals are observed notional, not the market's exact total liquidation volume.
+Reconnect does not recover missing liquidation events or prove lossless depth.
 
 Open interest value and its one-hour change are refreshed periodically from Binance's
 5-minute statistics. A Binance WebSocket candle marked `x=true` can still be revised,

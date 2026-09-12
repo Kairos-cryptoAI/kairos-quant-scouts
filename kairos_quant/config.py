@@ -8,6 +8,7 @@ from kairos_core.config import CoreSettings
 from pydantic import Field, model_validator
 
 from .indicators import MACD_MIN_SAMPLES
+from .stream_routes import websocket_root
 
 
 class QuantSettings(CoreSettings):
@@ -54,8 +55,10 @@ class QuantSettings(CoreSettings):
             raise ValueError("maximum reconnect delay cannot be below its initial delay")
         if self.enable_venue_quality_gate and self.evedex_dev_base_url != ("https://trading-api.evedex.tech"):
             raise ValueError("runtime venue gate requires the exact official EVEDEX DEV URL")
+        websocket_root(self.binance_ws_base)
         return self
 
     # Binance USD-M Futures endpoints (used for tests / dev; EVEDEX feed lives in the execution repo).
-    binance_ws_base: str = "wss://fstream.binance.com/stream"
+    # The collector selects /public/stream and /market/stream independently.
+    binance_ws_base: str = "wss://fstream.binance.com"
     binance_rest_base: str = "https://fapi.binance.com"

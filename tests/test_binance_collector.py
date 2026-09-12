@@ -18,10 +18,11 @@ def _collector(*, clock=lambda: 100.0, wall_clock=lambda: 1_000.0, **overrides) 
 
 
 def test_subscribes_to_depth_funding_closed_klines_and_liquidations():
-    streams = _collector()._streams().split("/")
+    public = _collector()._streams("public").split("/")
+    streams = _collector()._streams("market").split("/")
 
+    assert public == ["btcusdt@depth10@100ms"]
     assert streams == [
-        "btcusdt@depth10@100ms",
         "btcusdt@markPrice@1s",
         "btcusdt@kline_1m",
         "btcusdt@forceOrder",

@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import re
 import time
 from collections import deque
 from collections.abc import Callable
@@ -19,6 +20,7 @@ import aiohttp
 from kairos_core.logging import get_logger
 
 from ..orderbook import normalize_order_book
+from ..stream_routes import STREAM_ROUTES, StreamRoute, websocket_root
 
 log = get_logger("quant-scouts.binance")
 
@@ -77,9 +79,10 @@ class BinanceFuturesCollector:
             raise ValueError("maximum exchange future skew cannot be negative")
 
         self.symbols = list(dict.fromkeys(symbol.strip().lower() for symbol in symbols))
-        if not self.symbols or any(not symbol for symbol in self.symbols):
-            raise ValueError("at least one non-empty symbol is required")
-        self.ws_base = ws_base
+        if not self.symbols or any(not re.fullmatch(r"[a-z0-9]{1,32}", symbol) for symbol in self.symbols):
+            raise ValueError("at least one valid alphanumeric Binance symbol is required")
+        self.ws_base = websocket_root(ws_base)
+        self._subscriptions = {route: frozenset(self._streams(route).split("/")) for route in STREAM_ROUTES}
         self.rest_base = rest_base
         self.reconnect_initial_s = reconnect_initial_s
         self.reconnect_max_s = reconnect_max_s
@@ -126,72 +129,107 @@ class BinanceFuturesCollector:
         self._liquidation_order: deque[tuple[str, int, str, float, float]] = deque()
         self._kline_refresh_lock = asyncio.Lock()
 
-    def _streams(self) -> str:
-        parts: list[str] = []
-        for symbol in self.symbols:
-            parts.extend(
-                (
-                    f"{symbol}@depth10@100ms",
-                    f"{symbol}@markPrice@1s",
-                    f"{symbol}@kline_1m",
-                    f"{symbol}@forceOrder",
-                )
-            )
-        return "/".join(parts)
+    def _streams(self, route: StreamRoute) -> str:
+        if route not in STREAM_ROUTES:
+            raise ValueError("unknown Binance stream route")
+        suffixes = ("depth10@100ms",) if route == "public" else ("markPrice@1s", "kline_1m", "forceOrder")
+        return "/".join(f"{symbol}@{suffix}" for symbol in self.symbols for suffix in suffixes)
 
-    async def run(self) -> None:  # pragma: no cover - exercises the live network
-        """Consume combined streams forever, reconnecting with bounded backoff."""
-        url = f"{self.ws_base}?streams={self._streams()}"
+    def _stream_urls(self) -> dict[StreamRoute, str]:
+        return {
+            route: f"{self.ws_base}/{route}/stream?streams={self._streams(route)}" for route in STREAM_ROUTES
+        }
+
+    async def run(self) -> None:
+        """Isolate public/market reconnects; fatal errors and cancellation close both."""
+        async with asyncio.TaskGroup() as tasks:
+            for route in STREAM_ROUTES:
+                tasks.create_task(self._run_stream(route), name=f"binance-ws-{route}")
+
+    def _invalidate_books(self) -> None:
+        for symbol in self.symbols:
+            self.books[symbol] = {"bids": [], "asks": []}
+            self._book_updated_at[symbol] = None
+            self._book_event_time_ms[symbol] = None
+        # Retain the high-water update IDs: reconnect is not permission to replay.
+
+    async def _run_stream(self, route: StreamRoute) -> None:
+        url = self._stream_urls()[route]
         backoff_s = self.reconnect_initial_s
         timeout = aiohttp.ClientTimeout(total=None, connect=15, sock_connect=15, sock_read=90)
 
         async with aiohttp.ClientSession(timeout=timeout) as session:
             while True:
                 received_data = False
+                if route == "public":
+                    self._invalidate_books()
                 try:
                     async with session.ws_connect(url, heartbeat=15, autoping=True) as ws:
-                        log.info("binance.connected", symbols=self.symbols)
-                        # Connect first so final kline events are buffered while the REST
-                        # backfill closes the startup/reconnect race window.
-                        await self.refresh_klines(session)
-                        async for message in ws:
-                            if message.type == aiohttp.WSMsgType.TEXT:
-                                try:
-                                    payload = json.loads(message.data)
-                                    if not isinstance(payload, dict):
-                                        raise ValueError("combined-stream payload must be an object")
-                                    received_data = self._on_message(payload) or received_data
-                                    if self._gap_backfill_due():
-                                        await self.refresh_klines(session)
-                                except (TypeError, ValueError, json.JSONDecodeError):
-                                    log.warning("binance.invalid_message")
-                            elif message.type in {
-                                aiohttp.WSMsgType.CLOSE,
-                                aiohttp.WSMsgType.CLOSED,
-                                aiohttp.WSMsgType.ERROR,
-                            }:
-                                break
+                        log.info("binance.connected", route=route, symbols=self.symbols)
+                        try:
+                            # Connect first so final kline events are buffered while the REST
+                            # backfill closes the startup/reconnect race window.
+                            # Depth must keep flowing independently while REST waits.
+                            if route == "market":
+                                await self.refresh_klines(session)
+                            async for message in ws:
+                                if message.type == aiohttp.WSMsgType.TEXT:
+                                    try:
+                                        payload = json.loads(message.data)
+                                        if not isinstance(payload, dict):
+                                            raise ValueError("combined-stream payload must be an object")
+                                        admitted = self._on_message(payload, route=route)
+                                        received_data = admitted or received_data
+                                        if admitted and route == "market" and self._gap_backfill_due():
+                                            await self.refresh_klines(session)
+                                    except (TypeError, ValueError, json.JSONDecodeError):
+                                        log.warning("binance.invalid_message", route=route)
+                                elif message.type in {
+                                    aiohttp.WSMsgType.CLOSE,
+                                    aiohttp.WSMsgType.CLOSED,
+                                    aiohttp.WSMsgType.ERROR,
+                                }:
+                                    break
+                        finally:
+                            # Revoke freshness before the close handshake can await network I/O.
+                            if route == "public":
+                                self._invalidate_books()
                 except asyncio.CancelledError:
                     raise
                 except (TimeoutError, aiohttp.ClientError) as exc:
                     log.warning(
                         "binance.disconnected",
+                        route=route,
                         error=type(exc).__name__,
                         retry_in_s=backoff_s,
                     )
+                finally:
+                    if route == "public":
+                        self._invalidate_books()
 
                 if received_data:
                     backoff_s = self.reconnect_initial_s
                 await asyncio.sleep(backoff_s)
                 backoff_s = min(backoff_s * 2, self.reconnect_max_s)
 
-    def _on_message(self, message: dict) -> bool:
-        stream = str(message.get("stream", ""))
+    def _on_message(self, message: dict, *, route: StreamRoute | None = None) -> bool:
+        stream = message.get("stream", "")
+        routes = STREAM_ROUTES if route is None else (route,)
+        if not isinstance(stream, str) or not any(
+            stream in self._subscriptions.get(item, ()) for item in routes
+        ):
+            return False
         stream_lower = stream.lower()
         symbol = stream_lower.partition("@")[0]
         data = message.get("data", {})
         if symbol not in self.books or not isinstance(data, dict):
             return False
+        if "s" in data and data["s"] != symbol.upper():
+            return False
+        for nested in ("k", "o"):
+            body = data.get(nested)
+            if isinstance(body, dict) and "s" in body and body["s"] != symbol.upper():
+                return False
 
         if "@depth" in stream_lower:
             update_id = self._integer(data.get("u"))
