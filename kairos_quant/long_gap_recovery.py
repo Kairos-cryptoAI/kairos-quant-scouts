@@ -11,6 +11,7 @@ import asyncio
 import json
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
@@ -32,6 +33,58 @@ Publish = Callable[[ClosedBarEventV1], Awaitable[None]]
 
 class RecoveryError(ValueError):
     """Safe operational reason that contains no payload or secret values."""
+
+
+@dataclass
+class RecoveryStatus:
+    """Operational state only; never store REST bodies, DSNs or exception text."""
+
+    emit: Callable[[dict[str, Any]], None]
+    phase: str = "VALIDATE_SETTINGS"
+    symbol: str | None = None
+    window_start_ms: int | None = None
+    window_end_exclusive_ms: int | None = None
+    last_progress_at_utc: str | None = None
+    confirmed_through_exclusive_ms: dict[str, int] = field(default_factory=dict)
+    total_appended_bars: int = 0
+    first_failure_phase: str | None = None
+
+    def enter(
+        self, phase: str, *, symbol: str | None = None, start: int | None = None, end: int | None = None
+    ) -> None:
+        self.phase, self.symbol = phase, symbol
+        self.window_start_ms, self.window_end_exclusive_ms = start, end
+
+    def confirmed(self, event: ClosedBarEventV1, *, appended: bool = False) -> None:
+        self.confirmed_through_exclusive_ms[event.symbol] = event.close_time_ms + 1
+        self.last_progress_at_utc = datetime.now(UTC).isoformat()
+        if appended:
+            self.total_appended_bars += 1
+
+    def record(self, state: str, **details: Any) -> None:
+        self.emit(
+            {
+                "state": state,
+                "phase": self.phase,
+                "symbol": self.symbol,
+                "window_start_ms": self.window_start_ms,
+                "window_end_exclusive_ms": self.window_end_exclusive_ms,
+                "last_progress_at_utc": self.last_progress_at_utc,
+                "confirmed_through_exclusive_ms": dict(self.confirmed_through_exclusive_ms),
+                "total_appended_bars": self.total_appended_bars,
+                **details,
+            }
+        )
+
+    def failed(self, exc: BaseException) -> None:
+        self.first_failure_phase = self.first_failure_phase or self.phase
+        self.record(
+            "FAILED",
+            error_type=type(exc).__name__,
+            reason=str(exc) if isinstance(exc, RecoveryError) else "operation failed; payload withheld",
+            first_failure_phase=self.first_failure_phase,
+            publish_outcome="UNKNOWN" if self.phase == "DURABLE_PUBLISH" else "NOT_ATTEMPTED_IN_PHASE",
+        )
 
 
 def parse_page(raw: object, *, symbol: str, start: int, end: int) -> tuple[ClosedBarEventV1, ...]:
@@ -74,41 +127,56 @@ async def recover_symbol(
     page_size: int = 200,
     pause: Callable[[], Awaitable[None]],
     progress: Callable[[dict[str, Any]], None],
+    status: RecoveryStatus | None = None,
 ) -> int:
+    status = status or RecoveryStatus(progress)
+    status.enter("VALIDATE_INTERVAL", symbol=anchor.symbol, start=anchor.open_time_ms, end=end_exclusive)
     if not 2 <= page_size <= 200 or end_exclusive % MINUTE or end_exclusive <= anchor.open_time_ms:
         raise RecoveryError("invalid bounded recovery interval")
     appended = 0
     current = anchor
+    status.confirmed(anchor)
     while current.close_time_ms + 1 < end_exclusive:
         start = current.open_time_ms
         end = min(end_exclusive, start + page_size * MINUTE)
-        first = parse_page(
-            await fetch(current.symbol, start, end), symbol=current.symbol, start=start, end=end
-        )
+        status.enter("REST_GET_FIRST", symbol=current.symbol, start=start, end=end)
+        raw = await fetch(current.symbol, start, end)
+        status.enter("REST_VALIDATE_FIRST", symbol=current.symbol, start=start, end=end)
+        first = parse_page(raw, symbol=current.symbol, start=start, end=end)
+        status.enter("CONFIRMATION_DELAY", symbol=current.symbol, start=start, end=end)
         await pause()
-        second = parse_page(
-            await fetch(current.symbol, start, end), symbol=current.symbol, start=start, end=end
-        )
+        status.enter("REST_GET_SECOND", symbol=current.symbol, start=start, end=end)
+        raw = await fetch(current.symbol, start, end)
+        status.enter("REST_VALIDATE_SECOND", symbol=current.symbol, start=start, end=end)
+        second = parse_page(raw, symbol=current.symbol, start=start, end=end)
+        status.enter("CONFIRMATION_COMPARE", symbol=current.symbol, start=start, end=end)
         if first != second or first[0].canonical_bar_bytes() != current.canonical_bar_bytes():
             raise RecoveryError("recovery REST confirmation or persisted anchor conflict")
         # Validate the entire page before publishing any row. Every publish
         # atomically inserts event_audit and outbox; no ACK/cursor can outrun it.
         for event in first[1:]:
+            status.enter(
+                "DURABLE_PUBLISH", symbol=event.symbol, start=event.open_time_ms, end=event.close_time_ms + 1
+            )
             await publish(event)
             current = event
             appended += 1
-        progress(
-            {
-                "symbol": current.symbol,
-                "through_exclusive_ms": current.close_time_ms + 1,
-                "appended_bars": appended,
-                "retrieved_at_utc": datetime.now(UTC).isoformat(),
-            }
+            status.confirmed(event, appended=True)
+        status.enter("PAGE_COMMITTED", symbol=current.symbol, start=start, end=end)
+        status.record(
+            "PROGRESS",
+            through_exclusive_ms=current.close_time_ms + 1,
+            appended_bars=appended,
+            retrieved_at_utc=datetime.now(UTC).isoformat(),
         )
     return appended
 
 
-async def load_anchor(bus: DurableMessageBus, symbol: str) -> ClosedBarEventV1:
+async def load_anchor(
+    bus: DurableMessageBus, symbol: str, *, status: RecoveryStatus | None = None
+) -> ClosedBarEventV1:
+    if status is not None:
+        status.enter("RESTORE_READ", symbol=symbol)
     if bus.repository is None:
         raise RuntimeError("recovery repository unavailable")
     # Validate the persisted timeline without reading strategy/trade performance.
@@ -121,6 +189,8 @@ async def load_anchor(bus: DurableMessageBus, symbol: str) -> ClosedBarEventV1:
         symbol,
     )
     previous = None
+    if status is not None:
+        status.enter("RESTORE_VALIDATE", symbol=symbol)
     for record in rows:
         raw = record["payload"]
         event = ClosedBarEventV1.model_validate(json.loads(raw) if isinstance(raw, str) else raw)
@@ -129,10 +199,27 @@ async def load_anchor(bus: DurableMessageBus, symbol: str) -> ClosedBarEventV1:
         previous = event
     if previous is None:
         raise RecoveryError("recovery requires an existing authoritative anchor for every symbol")
+    if status is not None:
+        status.confirmed(previous)
     return previous
 
 
-async def run_recovery(end_exclusive: int, maximum_bars: int) -> None:
+async def run_recovery(
+    end_exclusive: int, maximum_bars: int, *, status: RecoveryStatus | None = None
+) -> None:
+    status = status or RecoveryStatus(lambda item: print(json.dumps(item), flush=True))
+    status.record("STARTED", end_exclusive_ms=end_exclusive, maximum_bars=maximum_bars)
+    try:
+        await _run_recovery(end_exclusive, maximum_bars, status)
+    except BaseException as exc:
+        if status.first_failure_phase is None:
+            status.failed(exc)
+        raise
+    status.enter("FINISHED")
+    status.record("COMPLETED", end_exclusive_ms=end_exclusive)
+
+
+async def _run_recovery(end_exclusive: int, maximum_bars: int, status: RecoveryStatus) -> None:
     settings = QuantSettings()
     if (
         settings.environment != "paper"
@@ -149,55 +236,83 @@ async def run_recovery(end_exclusive: int, maximum_bars: int) -> None:
         or not 1 <= maximum_bars <= 150_000
     ):
         raise RecoveryError("recovery deadline must be closed and budget at most 150000 bars")
+    status.enter("BUILD_BUS")
     bus = DurableMessageBus(build_bus(settings), service_name=SOURCE)
     try:
+        status.enter("PRODUCER_LEASE_ACQUIRE")
         async with producer_lease(bus):
-            anchors = [await load_anchor(bus, symbol) for symbol in SYMBOLS]
-            if any(anchor.close_time_ms + 1 > end_exclusive for anchor in anchors):
-                raise RecoveryError("recovery deadline precedes committed history")
-            required = sum((end_exclusive - anchor.close_time_ms - 1) // MINUTE for anchor in anchors)
-            if required > maximum_bars:
-                raise RecoveryError("recovery exceeds its explicit bar budget")
-            print(
-                json.dumps(
-                    {"state": "STARTED", "bars_required": required, "end_exclusive_ms": end_exclusive}
-                ),
-                flush=True,
-            )
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
-
-                async def fetch(symbol: str, start: int, end: int) -> object:
-                    async with session.get(
-                        settings.binance_rest_base + "/fapi/v1/klines",
-                        params={
-                            "symbol": symbol,
-                            "interval": "1m",
-                            "startTime": start,
-                            "endTime": end - 1,
-                            "limit": (end - start) // MINUTE,
-                        },
-                    ) as response:
-                        response.raise_for_status()
-                        return await response.json()
-
-                async def publish(event: ClosedBarEventV1) -> None:
-                    await bus.publish(Topics.CLOSED_BAR, event)
-
-                async def pause() -> None:
-                    await asyncio.sleep(max(1.0, settings.kline_finality_delay_s))
-
-                for anchor in anchors:
-                    await recover_symbol(
-                        anchor,
-                        end_exclusive=end_exclusive,
-                        fetch=fetch,
-                        publish=publish,
-                        pause=pause,
-                        progress=lambda item: print(json.dumps(item), flush=True),
-                    )
-            print(json.dumps({"state": "COMPLETED", "end_exclusive_ms": end_exclusive}), flush=True)
+            try:
+                await _recover_with_lease(bus, settings, end_exclusive, maximum_bars, status)
+            except BaseException as exc:
+                # Capture the failing operation before lease/pool cleanup can
+                # change phase or itself fail. No publish is ever retried here.
+                status.failed(exc)
+                raise
+            status.enter("PRODUCER_LEASE_RELEASE")
+    except BaseException as exc:
+        if status.first_failure_phase is None:
+            status.failed(exc)
+        raise
     finally:
-        await bus.close()
+        status.enter("BUS_CLOSE")
+        try:
+            await bus.close()
+        except BaseException as exc:
+            previous_failure = status.first_failure_phase is not None
+            status.failed(exc)
+            if not previous_failure:
+                raise
+
+
+async def _recover_with_lease(
+    bus: DurableMessageBus,
+    settings: QuantSettings,
+    end_exclusive: int,
+    maximum_bars: int,
+    status: RecoveryStatus,
+) -> None:
+    anchors = [await load_anchor(bus, symbol, status=status) for symbol in SYMBOLS]
+    status.enter("VALIDATE_BUDGET")
+    if any(anchor.close_time_ms + 1 > end_exclusive for anchor in anchors):
+        raise RecoveryError("recovery deadline precedes committed history")
+    required = sum((end_exclusive - anchor.close_time_ms - 1) // MINUTE for anchor in anchors)
+    if required > maximum_bars:
+        raise RecoveryError("recovery exceeds its explicit bar budget")
+    status.record("PROGRESS", bars_required=required, end_exclusive_ms=end_exclusive)
+    status.enter("REST_SESSION_OPEN")
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+
+        async def fetch(symbol: str, start: int, end: int) -> object:
+            async with session.get(
+                settings.binance_rest_base + "/fapi/v1/klines",
+                params={
+                    "symbol": symbol,
+                    "interval": "1m",
+                    "startTime": start,
+                    "endTime": end - 1,
+                    "limit": (end - start) // MINUTE,
+                },
+            ) as response:
+                response.raise_for_status()
+                return await response.json()
+
+        async def publish(event: ClosedBarEventV1) -> None:
+            await bus.publish(Topics.CLOSED_BAR, event)
+
+        async def pause() -> None:
+            await asyncio.sleep(max(1.0, settings.kline_finality_delay_s))
+
+        for anchor in anchors:
+            await recover_symbol(
+                anchor,
+                end_exclusive=end_exclusive,
+                fetch=fetch,
+                publish=publish,
+                pause=pause,
+                progress=status.emit,
+                status=status,
+            )
+        status.enter("REST_SESSION_CLOSE")
 
 
 def main() -> None:
@@ -208,10 +323,8 @@ def main() -> None:
     args = parser.parse_args()
     try:
         asyncio.run(run_recovery(args.end_exclusive_ms, args.maximum_bars))
-    except Exception as exc:
-        # Do not echo connection strings from infrastructure exceptions.
-        reason = str(exc) if isinstance(exc, RecoveryError) else "inspect failed phase; payload withheld"
-        print(json.dumps({"state": "FAILED", "error_type": type(exc).__name__, "reason": reason}), flush=True)
+    except Exception:
+        # run_recovery already emitted a sanitized failure with exact phase.
         raise SystemExit(1) from None
 
 
