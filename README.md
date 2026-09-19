@@ -6,21 +6,47 @@ For an outage beyond the live collector's bounded REST window, use the deploy
 long-gap recovery wrapper in the isolated `kairos-paper-gate` project. Stop the
 old quant producer and strategy/risk/execution consumers first; preserve a fresh
 PostgreSQL backup. The module `kairos_quant.long_gap_recovery` requires an
-explicit closed end boundary, a total bar budget (at most 150,000) and offline
-consumer confirmation. It accepts only the five-symbol PAPER Redis profile and
-the official Binance UM URL. No trading credentials or LLM/feed APIs are used.
+explicit closed end boundary, total bar budget (at most 150,000), exact expected
+database name and offline consumer confirmation. It accepts only the five-symbol
+PAPER profile and the official Binance UM URL. No trading credentials or LLM/feed
+APIs are used.
 
 Each page includes the persisted anchor, requires two identical full REST
-responses, and publishes only a contiguous verified suffix via the existing
-atomic event-audit/outbox path. Resume reads the durable audit prefix, never an
+responses, and appends only a contiguous verified suffix through an isolated,
+atomic event-audit/outbox writer. It verifies the exact retained migration profile
+`001` through `012` and holds both the migration guard and live Quant producer
+lease. It never runs migrations, opens Redis, starts an outbox dispatcher or
+guesses the target database. Resume reads the durable audit prefix, never an
 uncommitted memory cursor. Conflicting history/anchors, missing/reordered bars,
 non-finite values, request errors or exhausted bounds stop the operation.
 Structured logs expose retrieval time, coverage and stop reason, not PnL.
 
+For a bounded increment, add `--maximum-append-bars 1000` to the existing
+invocation while retaining its **exact original `--end-exclusive-ms`**. This
+optional limit must be an integer from 1 to 150,000 and cannot exceed
+`--maximum-bars`. It is shared across all five symbols in the established
+BTC/ETH/SOL/BNB/XRP order, not a per-symbol allowance. `--maximum-bars` still
+checks the **entire remaining gap**; a small append limit cannot bypass that
+total-budget guard. Omitting the new option preserves full bounded recovery.
+
+Each request is shortened before fetching to the remaining append allowance
+plus its authoritative anchor; both complete REST responses are still
+validated. `PAUSED_LIMIT` is emitted only after HTTP-session, producer-lease and
+offline-writer cleanup succeeds, and only when bars remain. `COMPLETED` requires zero
+remaining bars. Receipts retain the fixed end, `planned_remaining_bars`,
+`actual_appended_bars`, and `remaining_bars`. A cleanup error remains `FAILED`,
+never a successful pause. A publish with unknown outcome is never retried in
+the same invocation: `total_appended_bars` reports only acknowledged appends,
+while actual appended/remaining counts are `null` until a new explicit run
+reloads the durable prefix. Resume uses the same fixed end and fresh per-run
+allowance without republishing accepted history.
+
 Live quant and offline recovery share an exclusive PostgreSQL advisory lease.
-Do not run older images without this lease alongside recovery. After repair,
-validate per-symbol continuity and restore the stopped read-only consumers;
-do not delete Redis entries, inbox cursors, audit history or old backups.
+Do not run older images without this lease alongside recovery. The deploy wrapper
+requires `-ExpectedDatabaseName`; pass the known isolated database identity rather
+than inferring one from a connection string. After repair, validate per-symbol
+continuity and restore the stopped read-only consumers; do not delete Redis entries,
+inbox cursors, audit history or old backups.
 Historical restoration does not count as continuous online observation or a
 fresh 24-hour DEV qualification window.
 

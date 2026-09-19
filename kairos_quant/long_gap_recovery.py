@@ -1,4 +1,4 @@
-"""Explicit, offline PAPER bar repair through the existing durable publish path.
+"""Explicit, offline PAPER bar repair through an isolated durable writer.
 
 Run only with strategy/risk/execution consumers stopped. No venue mutation or
 paid API exists here. Restart resumes from committed event_audit, not RAM.
@@ -16,17 +16,29 @@ from datetime import UTC, datetime
 from typing import Any
 
 import aiohttp
-from kairos_core.bus import build_bus
 from kairos_core.contracts import ClosedBarEventV1
 from kairos_core.topics import Topics
-from kairos_persistence import DurableMessageBus
+from kairos_persistence import OfflineDurableWriter
 
 from .config import QuantSettings
-from .producer_lease import producer_lease
 
 MINUTE = 60_000
 SOURCE = "kairos-quant-scouts"
 SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT")
+RECOVERY_SCHEMA_VERSIONS = (
+    "001_audit_and_idempotency.sql",
+    "002_durable_runtime.sql",
+    "003_execution_effect_journal.sql",
+    "004_execution_recovery_delay.sql",
+    "005_source_state_and_usage.sql",
+    "006_paper_trade_lifecycle.sql",
+    "007_execution_runtime_health.sql",
+    "008_public_execution_events.sql",
+    "009_paper_canary_arms.sql",
+    "010_runtime_compensation_reserve.sql",
+    "011_execution_mutation_budget.sql",
+    "012_outbox_producer_order.sql",
+)
 FetchPage = Callable[[str, int, int], Awaitable[object]]
 Publish = Callable[[ClosedBarEventV1], Awaitable[None]]
 
@@ -48,6 +60,16 @@ class RecoveryStatus:
     confirmed_through_exclusive_ms: dict[str, int] = field(default_factory=dict)
     total_appended_bars: int = 0
     first_failure_phase: str | None = None
+    end_exclusive_ms: int | None = None
+    maximum_append_bars: int | None = None
+    planned_remaining_bars: int | None = None
+    publish_outcome_unknown: bool = False
+
+    @property
+    def remaining_bars(self) -> int | None:
+        if self.planned_remaining_bars is None or self.publish_outcome_unknown:
+            return None
+        return self.planned_remaining_bars - self.total_appended_bars
 
     def enter(
         self, phase: str, *, symbol: str | None = None, start: int | None = None, end: int | None = None
@@ -73,12 +95,18 @@ class RecoveryStatus:
                 "last_progress_at_utc": self.last_progress_at_utc,
                 "confirmed_through_exclusive_ms": dict(self.confirmed_through_exclusive_ms),
                 "total_appended_bars": self.total_appended_bars,
+                "actual_appended_bars": None if self.publish_outcome_unknown else self.total_appended_bars,
+                "end_exclusive_ms": self.end_exclusive_ms,
+                "maximum_append_bars": self.maximum_append_bars,
+                "planned_remaining_bars": self.planned_remaining_bars,
+                "remaining_bars": self.remaining_bars,
                 **details,
             }
         )
 
     def failed(self, exc: BaseException) -> None:
         self.first_failure_phase = self.first_failure_phase or self.phase
+        self.publish_outcome_unknown = self.publish_outcome_unknown or self.phase == "DURABLE_PUBLISH"
         self.record(
             "FAILED",
             error_type=type(exc).__name__,
@@ -174,14 +202,14 @@ async def recover_symbol(
 
 
 async def load_anchor(
-    bus: DurableMessageBus, symbol: str, *, status: RecoveryStatus | None = None
+    writer: OfflineDurableWriter, symbol: str, *, status: RecoveryStatus | None = None
 ) -> ClosedBarEventV1:
     if status is not None:
         status.enter("RESTORE_READ", symbol=symbol)
-    if bus.repository is None:
+    if writer.repository is None:
         raise RuntimeError("recovery repository unavailable")
     # Validate the persisted timeline without reading strategy/trade performance.
-    rows = await bus.repository.pool.fetch(
+    rows = await writer.repository.pool.fetch(
         """SELECT payload FROM event_audit WHERE topic=$1 AND source=$2
              AND payload->>'symbol'=$3 AND payload->>'venue'='BINANCE_UM'
              ORDER BY (payload->>'open_time_ms')::bigint""",
@@ -206,21 +234,53 @@ async def load_anchor(
 
 
 async def run_recovery(
-    end_exclusive: int, maximum_bars: int, *, status: RecoveryStatus | None = None
+    end_exclusive: int,
+    maximum_bars: int,
+    *,
+    expected_database_name: str,
+    maximum_append_bars: int | None = None,
+    status: RecoveryStatus | None = None,
 ) -> None:
     status = status or RecoveryStatus(lambda item: print(json.dumps(item), flush=True))
+    status.end_exclusive_ms = end_exclusive
+    status.maximum_append_bars = maximum_append_bars
     status.record("STARTED", end_exclusive_ms=end_exclusive, maximum_bars=maximum_bars)
     try:
-        await _run_recovery(end_exclusive, maximum_bars, status)
+        await _run_recovery(
+            end_exclusive,
+            maximum_bars,
+            status,
+            expected_database_name=expected_database_name,
+            maximum_append_bars=maximum_append_bars,
+        )
+        remaining = status.remaining_bars
+        if remaining is None or remaining < 0:
+            raise RecoveryError("recovery finished without an exact bounded remaining count")
     except BaseException as exc:
         if status.first_failure_phase is None:
             status.failed(exc)
         raise
     status.enter("FINISHED")
-    status.record("COMPLETED", end_exclusive_ms=end_exclusive)
+    status.record("PAUSED_LIMIT" if remaining else "COMPLETED", end_exclusive_ms=end_exclusive)
 
 
-async def _run_recovery(end_exclusive: int, maximum_bars: int, status: RecoveryStatus) -> None:
+async def _run_recovery(
+    end_exclusive: int,
+    maximum_bars: int,
+    status: RecoveryStatus,
+    *,
+    expected_database_name: str,
+    maximum_append_bars: int | None = None,
+) -> None:
+    if maximum_append_bars is not None and (
+        type(maximum_append_bars) is not int
+        or not 1 <= maximum_append_bars <= 150_000
+        or type(maximum_bars) is not int
+        or maximum_append_bars > maximum_bars
+    ):
+        raise RecoveryError("recovery append limit must be an integer from 1 to the explicit bar budget")
+    if not isinstance(expected_database_name, str) or not expected_database_name.strip():
+        raise RecoveryError("recovery requires a non-empty expected database name")
     settings = QuantSettings()
     if (
         settings.environment != "paper"
@@ -237,27 +297,37 @@ async def _run_recovery(end_exclusive: int, maximum_bars: int, status: RecoveryS
         or not 1 <= maximum_bars <= 150_000
     ):
         raise RecoveryError("recovery deadline must be closed and budget at most 150000 bars")
-    status.enter("BUILD_BUS")
-    bus = DurableMessageBus(build_bus(settings), service_name=SOURCE)
+    status.enter("BUILD_OFFLINE_WRITER")
+    writer = OfflineDurableWriter(
+        service_name=SOURCE,
+        expected_database_name=expected_database_name,
+        expected_schema_versions=RECOVERY_SCHEMA_VERSIONS,
+    )
     try:
-        status.enter("PRODUCER_LEASE_ACQUIRE")
-        async with producer_lease(bus):
-            try:
-                await _recover_with_lease(bus, settings, end_exclusive, maximum_bars, status)
-            except BaseException as exc:
-                # Capture the failing operation before lease/pool cleanup can
-                # change phase or itself fail. No publish is ever retried here.
-                status.failed(exc)
-                raise
-            status.enter("PRODUCER_LEASE_RELEASE")
+        status.enter("OFFLINE_WRITER_START")
+        await writer.start()
+        try:
+            await _recover_with_lease(
+                writer,
+                settings,
+                end_exclusive,
+                maximum_bars,
+                status,
+                maximum_append_bars=maximum_append_bars,
+            )
+        except BaseException as exc:
+            # Capture the failing operation before writer cleanup can change
+            # phase or itself fail. No append is ever retried in this run.
+            status.failed(exc)
+            raise
     except BaseException as exc:
         if status.first_failure_phase is None:
             status.failed(exc)
         raise
     finally:
-        status.enter("BUS_CLOSE")
+        status.enter("OFFLINE_WRITER_CLOSE")
         try:
-            await bus.close()
+            await writer.close()
         except BaseException as exc:
             previous_failure = status.first_failure_phase is not None
             status.failed(exc)
@@ -266,17 +336,20 @@ async def _run_recovery(end_exclusive: int, maximum_bars: int, status: RecoveryS
 
 
 async def _recover_with_lease(
-    bus: DurableMessageBus,
+    writer: OfflineDurableWriter,
     settings: QuantSettings,
     end_exclusive: int,
     maximum_bars: int,
     status: RecoveryStatus,
+    *,
+    maximum_append_bars: int | None = None,
 ) -> None:
-    anchors = [await load_anchor(bus, symbol, status=status) for symbol in SYMBOLS]
+    anchors = [await load_anchor(writer, symbol, status=status) for symbol in SYMBOLS]
     status.enter("VALIDATE_BUDGET")
     if any(anchor.close_time_ms + 1 > end_exclusive for anchor in anchors):
         raise RecoveryError("recovery deadline precedes committed history")
     required = sum((end_exclusive - anchor.close_time_ms - 1) // MINUTE for anchor in anchors)
+    status.planned_remaining_bars = required
     if required > maximum_bars:
         raise RecoveryError("recovery exceeds its explicit bar budget")
     status.record("PROGRESS", bars_required=required, end_exclusive_ms=end_exclusive)
@@ -298,15 +371,23 @@ async def _recover_with_lease(
                 return await response.json()
 
         async def publish(event: ClosedBarEventV1) -> None:
-            await bus.publish(Topics.CLOSED_BAR, event)
+            await writer.append(Topics.CLOSED_BAR, event)
 
         async def pause() -> None:
             await asyncio.sleep(max(1.0, settings.kline_finality_delay_s))
 
+        append_limit = maximum_bars if maximum_append_bars is None else maximum_append_bars
         for anchor in anchors:
+            available = append_limit - status.total_appended_bars
+            if available <= 0:
+                break
+            # Bound the requested interval before fetching. recover_symbol still
+            # validates both complete pages, including their authoritative anchor;
+            # never fetch a larger page and validate/publish only a chosen prefix.
+            symbol_end = min(end_exclusive, anchor.close_time_ms + 1 + available * MINUTE)
             await recover_symbol(
                 anchor,
-                end_exclusive=end_exclusive,
+                end_exclusive=symbol_end,
                 fetch=fetch,
                 publish=publish,
                 pause=pause,
@@ -320,10 +401,19 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--end-exclusive-ms", type=int, required=True)
     parser.add_argument("--maximum-bars", type=int, required=True)
+    parser.add_argument("--expected-database-name", required=True)
+    parser.add_argument("--maximum-append-bars", type=int)
     parser.add_argument("--offline-consumers-confirmed", action="store_true", required=True)
     args = parser.parse_args()
     try:
-        asyncio.run(run_recovery(args.end_exclusive_ms, args.maximum_bars))
+        asyncio.run(
+            run_recovery(
+                args.end_exclusive_ms,
+                args.maximum_bars,
+                expected_database_name=args.expected_database_name,
+                maximum_append_bars=args.maximum_append_bars,
+            )
+        )
     except Exception:
         # run_recovery already emitted a sanitized failure with exact phase.
         raise SystemExit(1) from None
