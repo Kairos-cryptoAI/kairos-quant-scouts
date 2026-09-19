@@ -11,6 +11,7 @@ import pytest
 
 from kairos_quant.collectors import binance_ws
 from kairos_quant.collectors.binance_ws import BinanceFuturesCollector
+from kairos_quant.simulation_book import SimulationBookTapeBlocked, SimulationBookTapeRecorder
 
 
 class FakeWebSocket:
@@ -266,6 +267,42 @@ async def test_public_disconnect_invalidates_book_until_new_nonreplayed_snapshot
         assert subject.is_book_fresh("btcusdt", 10)
     finally:
         await cancel_and_join(task)
+    sessions.assert_closed()
+
+
+async def test_simulator_recorder_terminates_its_tape_on_public_reconnect(monkeypatch):
+    recorder = SimulationBookTapeRecorder(
+        tape_id="sim-tape",
+        wall_clock_ms=lambda: 1_000_000,
+    )
+    subject = collector(simulation_book_recorder=recorder)
+    sessions = install_fakes(monkeypatch, subject)
+    task = asyncio.create_task(subject.run())
+    try:
+        public = await sessions.connection("public")
+        await sessions.connection("market")
+        public.send(depth_message())
+        for _ in range(100):
+            if recorder.pending_frames():
+                break
+            await asyncio.sleep(0.001)
+        assert len(recorder.pending_frames()) == 1
+
+        public.disconnect()
+        with pytest.raises(ExceptionGroup) as raised:
+            await asyncio.wait_for(task, timeout=2)
+        assert any(
+            isinstance(error, SimulationBookTapeBlocked) and "active simulation tape" in str(error)
+            for error in raised.value.exceptions
+        )
+        frames = recorder.pending_frames()
+        assert [frame.continuity for frame in frames] == ["ADMITTED", "RECONNECT"]
+        assert frames[1].previous_frame_sha256 == frames[0].frame_sha256
+        assert recorder.status.state == "BLOCKED"
+        assert recorder.status.blocked_reason == "PUBLIC_STREAM_RECONNECT"
+    finally:
+        if not task.done():
+            await cancel_and_join(task)
     sessions.assert_closed()
 
 

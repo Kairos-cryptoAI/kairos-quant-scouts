@@ -20,6 +20,7 @@ import aiohttp
 from kairos_core.logging import get_logger
 
 from ..orderbook import normalize_order_book
+from ..simulation_book import SimulationBookTapeBlocked, SimulationBookTapeRecorder
 from ..stream_routes import STREAM_ROUTES, StreamRoute, websocket_root
 
 log = get_logger("quant-scouts.binance")
@@ -68,6 +69,7 @@ class BinanceFuturesCollector:
         max_exchange_future_skew_s: float = 2.0,
         clock: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], float] = time.time,
+        simulation_book_recorder: SimulationBookTapeRecorder | None = None,
     ) -> None:
         if reconnect_initial_s <= 0 or reconnect_max_s < reconnect_initial_s:
             raise ValueError("invalid reconnect backoff")
@@ -91,6 +93,7 @@ class BinanceFuturesCollector:
         self._kline_buffer_size = kline_buffer_size
         self._kline_finality_delay_ms = math.ceil(kline_finality_delay_s * 1_000)
         self._max_exchange_future_skew_s = max_exchange_future_skew_s
+        self._simulation_book_recorder = simulation_book_recorder
 
         self.books: dict[str, dict[str, list[Level]]] = {
             symbol: {"bids": [], "asks": []} for symbol in self.symbols
@@ -161,12 +164,18 @@ class BinanceFuturesCollector:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             while True:
                 received_data = False
+                simulation_public_stream_started = False
                 if route == "public":
                     self._invalidate_books()
                 try:
                     async with session.ws_connect(url, heartbeat=15, autoping=True) as ws:
                         log.info("binance.connected", route=route, symbols=self.symbols)
                         try:
+                            if route == "public" and self._simulation_book_recorder is not None:
+                                self._simulation_book_recorder.begin_public_stream(
+                                    connected_at_ms=int(self._wall_clock() * 1_000)
+                                )
+                                simulation_public_stream_started = True
                             # Connect first so final kline events are buffered while the REST
                             # backfill closes the startup/reconnect race window.
                             # Depth must keep flowing independently while REST waits.
@@ -175,10 +184,20 @@ class BinanceFuturesCollector:
                             async for message in ws:
                                 if message.type == aiohttp.WSMsgType.TEXT:
                                     try:
-                                        payload = json.loads(message.data)
+                                        raw_payload = message.data
+                                        received_at_ms = int(self._wall_clock() * 1_000)
+                                        payload = json.loads(raw_payload)
                                         if not isinstance(payload, dict):
                                             raise ValueError("combined-stream payload must be an object")
-                                        admitted = self._on_message(payload, route=route)
+                                        if self._simulation_book_recorder is None:
+                                            admitted = self._on_message(payload, route=route)
+                                        else:
+                                            admitted = self._on_message(
+                                                payload,
+                                                route=route,
+                                                raw_payload=raw_payload,
+                                                received_at_ms=received_at_ms,
+                                            )
                                         received_data = admitted or received_data
                                         if admitted and route == "market" and self._gap_backfill_due():
                                             await self.refresh_klines(session)
@@ -194,6 +213,15 @@ class BinanceFuturesCollector:
                             # Revoke freshness before the close handshake can await network I/O.
                             if route == "public":
                                 self._invalidate_books()
+                                if (
+                                    simulation_public_stream_started
+                                    and self._simulation_book_recorder is not None
+                                ):
+                                    self._simulation_book_recorder.record_source_barrier(
+                                        continuity="RECONNECT",
+                                        at_ms=int(self._wall_clock() * 1_000),
+                                        reason="PUBLIC_STREAM_RECONNECT",
+                                    )
                 except asyncio.CancelledError:
                     raise
                 except (TimeoutError, aiohttp.ClientError) as exc:
@@ -207,12 +235,24 @@ class BinanceFuturesCollector:
                     if route == "public":
                         self._invalidate_books()
 
+                if simulation_public_stream_started:
+                    raise SimulationBookTapeBlocked(
+                        "public stream ended; the active simulation tape was explicitly blocked"
+                    )
+
                 if received_data:
                     backoff_s = self.reconnect_initial_s
                 await asyncio.sleep(backoff_s)
                 backoff_s = min(backoff_s * 2, self.reconnect_max_s)
 
-    def _on_message(self, message: dict, *, route: StreamRoute | None = None) -> bool:
+    def _on_message(
+        self,
+        message: dict,
+        *,
+        route: StreamRoute | None = None,
+        raw_payload: str | None = None,
+        received_at_ms: int | None = None,
+    ) -> bool:
         stream = message.get("stream", "")
         routes = STREAM_ROUTES if route is None else (route,)
         if not isinstance(stream, str) or not any(
@@ -247,6 +287,20 @@ class BinanceFuturesCollector:
                 bids, asks = normalize_order_book(bids, asks)
             except ValueError:
                 return False
+            if self._simulation_book_recorder is not None:
+                if raw_payload is None or received_at_ms is None:
+                    raise SimulationBookTapeBlocked(
+                        "simulation book capture requires original websocket text and receive time"
+                    )
+                self._simulation_book_recorder.capture_depth(
+                    raw_payload=raw_payload,
+                    symbol=symbol.upper(),
+                    exchange_update_id=update_id,
+                    exchange_at_ms=event_time_ms,
+                    received_at_ms=received_at_ms,
+                    bids=bids,
+                    asks=asks,
+                )
             self.books[symbol] = {"bids": bids, "asks": asks}
             self._last_book_update_id[symbol] = update_id
             self._book_event_time_ms[symbol] = event_time_ms
