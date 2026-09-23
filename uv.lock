@@ -464,7 +464,7 @@ dependencies = [
 [[package]]
 name = "kairos-persistence"
 version = "0.1.0"
-source = { git = "https://github.com/Kairos-cryptoAI/kairos-persistence.git?rev=ad566c2b61ceb5d90de3334d6e15511753562bd0#ad566c2b61ceb5d90de3334d6e15511753562bd0" }
+source = { git = "https://github.com/Kairos-cryptoAI/kairos-persistence.git?rev=56f5d630082441abe22f6e98b019d80b687cb2f7#56f5d630082441abe22f6e98b019d80b687cb2f7" }
 dependencies = [
     { name = "asyncpg" },
     { name = "kairos-core" },
@@ -498,7 +498,7 @@ dev = [
 requires-dist = [
     { name = "aiohttp", specifier = ">=3.10,<4" },
     { name = "kairos-core", git = "https://github.com/Kairos-cryptoAI/kairos-core.git?rev=0c8717c18d535465ae89c51bcd958b0884ec02ab" },
-    { name = "kairos-persistence", git = "https://github.com/Kairos-cryptoAI/kairos-persistence.git?rev=ad566c2b61ceb5d90de3334d6e15511753562bd0" },
+    { name = "kairos-persistence", git = "https://github.com/Kairos-cryptoAI/kairos-persistence.git?rev=56f5d630082441abe22f6e98b019d80b687cb2f7" },
     { name = "numpy", specifier = ">=1.26,<3" },
 ]
 
