@@ -51,8 +51,9 @@ Historical restoration does not count as continuous online observation or a
 fresh 24-hour DEV qualification window.
 
 **Layer 1A — Quant Scouts.** Pure-math collectors and indicators (no LLM). They
-connect to the exchange, digest raw order-book and derivatives streams, and emit a
-compact `MarketSnapshot` — the only numeric payload the upper layers consume.
+connect to the exchange and publish finalized `ClosedBarEventV1` candle events plus
+derived `MarketSnapshot` values built from closed-candle indicators, the current
+order book and derivatives observations. Raw trade ticks are not published.
 
 ## What it computes
 
@@ -63,8 +64,9 @@ compact `MarketSnapshot` — the only numeric payload the upper layers consume.
   ATR as a fraction of the last closed-candle price.
 - **Quant bias:** a transparent LONG/SHORT/FLAT vote from momentum, MACD, and book pressure.
 
-Raw ticks never leave this layer. RSI and MACD history is populated exclusively from
-closed Binance one-minute klines; the current order book is used only for live price,
+RSI and MACD history is populated exclusively from closed Binance one-minute klines;
+each accepted close is also published as a `ClosedBarEventV1` with its full OHLCV and
+taker-buy volumes. The current order book is used only for live price,
 spread, depth, and imbalance. Recursive EMA/Wilder state persists when the bounded raw
 candle window evicts old rows, so live values remain consistent with an unbounded replay.
 
@@ -109,9 +111,10 @@ must be a contiguous 13-point five-minute grid and its last source point cannot 
 checks both receipt time and the exchange close timestamp, so a newly received historical
 backfill cannot masquerade as current data.
 Liquidation totals are removed only after their snapshot is published successfully.
-The production EVEDEX feed lives in
-[`kairos-execution-engine`](https://github.com/Kairos-cryptoAI/kairos-execution-engine)
-and is injected through the same `SnapshotBuilder` contract.
+Quant's EVEDEX integration is a read-only DEV venue-quality monitor. The production
+execution/feed path belongs to
+[`kairos-execution-engine`](https://github.com/Kairos-cryptoAI/kairos-execution-engine);
+it is separate from Quant's Binance-derived `MarketSnapshot`.
 
 ## Venue comparison
 
