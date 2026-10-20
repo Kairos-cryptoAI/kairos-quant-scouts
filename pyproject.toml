@@ -11,7 +11,7 @@ license = { text = "MIT" }
 requires-python = ">=3.11"
 authors = [{ name = "TheLitis" }]
 dependencies = [
-    "aiohttp>=3.10,<4",
+    "aiohttp>=3.14.4,<4",
     "kairos-core>=0.3,<0.4",
     "kairos-persistence>=0.1,<0.2",
     "numpy>=1.26,<3",
@@ -31,8 +31,8 @@ dev = [
 required-version = "==0.12.3"
 
 [tool.uv.sources]
-kairos-core = { git = "https://github.com/Kairos-cryptoAI/kairos-core.git", rev = "6937eb4773fc00afaf5ba4e020b28b689f48e377" }
-kairos-persistence = { git = "https://github.com/Kairos-cryptoAI/kairos-persistence.git", rev = "ea0c73395352f71da196270fe16659f1f0298a52" }
+kairos-core = { git = "https://github.com/Kairos-cryptoAI/kairos-core.git", rev = "37165e3078b53364513f876f4243357ba19a19ba" }
+kairos-persistence = { git = "https://github.com/Kairos-cryptoAI/kairos-persistence.git", rev = "2d88a351fc045de5b58bbf6acae209341096a850" }
 
 [project.scripts]
 kairos-quant-scouts = "kairos_quant.service:main"

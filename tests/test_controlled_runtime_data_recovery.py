@@ -102,8 +102,33 @@ class Harness:
 
 def test_manifest_is_exact_controlled_runtime_profile_and_excludes_simulator():
     names = recovery.CONTROLLED_RUNTIME_SCHEMA_VERSIONS
+    assert names == (
+        "001_audit_and_idempotency.sql",
+        "002_durable_runtime.sql",
+        "003_execution_effect_journal.sql",
+        "004_execution_recovery_delay.sql",
+        "005_source_state_and_usage.sql",
+        "006_paper_trade_lifecycle.sql",
+        "007_execution_runtime_health.sql",
+        "008_public_execution_events.sql",
+        "009_paper_canary_arms.sql",
+        "010_runtime_compensation_reserve.sql",
+        "011_execution_mutation_budget.sql",
+        "012_outbox_producer_order.sql",
+        "013_campaign_source_budgets.sql",
+        "014_bounded_canary_sessions.sql",
+        "015_canary_dispatch_claims.sql",
+        "016_global_canary_session_guard.sql",
+        "018_offline_outbox_reconciliation.sql",
+        "026_operator_control.sql",
+        "028_news_processing.sql",
+    )
     assert names == recovery.Database.migration_names(recovery.MigrationProfile.CONTROLLED_RUNTIME)
-    assert names[-2:] == ("018_offline_outbox_reconciliation.sql", "026_operator_control.sql")
+    assert names[-3:] == (
+        "018_offline_outbox_reconciliation.sql",
+        "026_operator_control.sql",
+        "028_news_processing.sql",
+    )
     assert not any(
         name.startswith(("017_", "019_", "020_", "021_", "022_", "023_", "024_", "025_", "027_"))
         for name in names

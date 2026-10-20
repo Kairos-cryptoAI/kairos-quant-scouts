@@ -52,6 +52,7 @@ CONTROLLED_RUNTIME_SCHEMA_VERSIONS = (
     "016_global_canary_session_guard.sql",
     "018_offline_outbox_reconciliation.sql",
     "026_operator_control.sql",
+    "028_news_processing.sql",
 )
 
 
