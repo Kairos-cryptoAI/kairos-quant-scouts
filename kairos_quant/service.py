@@ -301,6 +301,22 @@ class QuantScoutsService:
                 if self.native_capture is not None:
                     await asyncio.sleep(0)
 
+            # Native warmup yields between bars so WebSocket frames can be
+            # consumed. A REST-confirmed bar may therefore enter the collector
+            # queue after pending_closed_klines() returned its initial snapshot.
+            # Its promotion also updates volume_usd; defer the snapshot until
+            # the next cycle has published and incorporated that bar into the
+            # same replay prefix. No await occurs between this check and build.
+            if self.native_capture is not None:
+                pending_native_bars = self.collector.pending_closed_klines(key)
+                if pending_native_bars:
+                    log.info(
+                        "snapshot.deferred_native_pending_closed_bars",
+                        symbol=symbol,
+                        count=len(pending_native_bars),
+                    )
+                    continue
+
             book = self.collector.books.get(key, {"bids": [], "asks": []})
             if (
                 not book["bids"]

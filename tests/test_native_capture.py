@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +13,7 @@ pytest.importorskip("kairos_core")
 
 from kairos_core.contracts import ClosedBarEventV1, canonical_json_bytes
 from kairos_core.contracts.base import datetime_from_unix_ms
+from kairos_core.topics import Topics
 
 from kairos_quant.collectors.binance_ws import BinanceFuturesCollector
 from kairos_quant.config import QuantSettings
@@ -395,7 +397,7 @@ def test_market_snapshot_replays_through_existing_collector_and_builder() -> Non
             {
                 "symbol": "BTCUSDT",
                 "timestamp": now_ms - 3_850_000 + index * 300_000,
-                "sumOpenInterestValue": str(1000 + index),
+                "sumOpenInterestValue": str(1000.1 + index * 0.4),
             }
             for index in range(13)
         ],
@@ -419,9 +421,10 @@ def test_market_snapshot_replays_through_existing_collector_and_builder() -> Non
     # Match the production OI input projection for this captured 13-point series.
     # The newest exchange sample is 250 seconds old but was fetched just now;
     # Quant's source-age allowance is 600 seconds and local freshness is recent.
-    observations = [(now_ms - 3_850_000 + index * 300_000, 1000 + index) for index in range(13)]
+    observations = [(now_ms - 3_850_000 + index * 300_000, 1000.1 + index * 0.4) for index in range(13)]
     collector.open_interest["btcusdt"] = float(observations[-1][1])
-    collector.oi_change_pct_1h["btcusdt"] = (
+    collector.oi_change_pct_1h["btcusdt"] = collector._pct_change(observations[0][1], observations[-1][1])
+    assert collector.oi_change_pct_1h["btcusdt"] != (
         100.0 * (observations[-1][1] - observations[0][1]) / observations[0][1]
     )
     builder = SnapshotBuilder("kairos-quant-scouts", window=200, depth_levels=10)
@@ -456,6 +459,7 @@ def test_market_snapshot_replays_through_existing_collector_and_builder() -> Non
         source_records=records,
         output_record=records[output_id],
     )
+    assert replayed == expected.model_dump(mode="json")
     assert replayed["symbol"] == expected.symbol
     assert replayed["order_book"] == expected.order_book.model_dump(mode="json")
 
@@ -649,6 +653,155 @@ async def test_websocket_flush_failure_prevents_snapshot_publication() -> None:
     with pytest.raises(NativeQuantSourceCaptureFailure):
         await service._emit_once()
     assert bus.published == 0
+
+
+@pytest.mark.asyncio
+async def test_native_snapshot_waits_for_bar_promoted_during_warmup_yield(monkeypatch) -> None:
+    import kairos_quant.service as service_module
+
+    sink = MemoryCreateOnlySink()
+    capture = NativeQuantCapture(sink, capture_epoch="e" * 32)
+    service = QuantScoutsService(
+        QuantSettings(bus_backend="memory", trading_symbols=["BTCUSDT"]), native_capture=capture
+    )
+    symbol = service.settings.symbols[0].upper()
+    key = symbol.lower()
+    collector = service.collector
+    collector.is_kline_stream_safe = lambda *_args: True  # type: ignore[method-assign]
+    collector.is_book_fresh = lambda *_args: True  # type: ignore[method-assign]
+    collector.is_kline_fresh = lambda *_args: True  # type: ignore[method-assign]
+    collector.is_funding_fresh = lambda *_args: True  # type: ignore[method-assign]
+    collector.is_open_interest_fresh = lambda *_args: True  # type: ignore[method-assign]
+    collector.books[key] = {"bids": [(100.0, 2.0)], "asks": [(101.0, 2.0)]}
+    collector.funding[key] = 0.0001
+    collector.open_interest[key] = 1_000.0
+    collector.oi_change_pct_1h[key] = 0.5
+    service._native_history_complete[symbol] = True
+
+    now_ms = time.time_ns() // 1_000_000
+    query = '{"interval":"1m","limit":"200","symbol":"BTCUSDT"}'
+
+    def bar_sources(open_ms: int, close_ms: int, quote_volume: int) -> tuple[str, str]:
+        body = json.dumps(
+            [
+                [
+                    open_ms,
+                    "100",
+                    "101",
+                    "99",
+                    "100",
+                    "10",
+                    close_ms,
+                    str(quote_volume),
+                    3,
+                    "5",
+                    str(quote_volume // 2),
+                    "0",
+                ]
+            ],
+            separators=(",", ":"),
+        ).encode()
+        first = capture.capture_source(
+            kind="BINANCE_KLINES_REST",
+            url="https://fapi.binance.com/fapi/v1/klines",
+            query_json=query,
+            raw_body=body,
+            requested_at_ms=now_ms - 5_000,
+            received_at_ms=now_ms - 4_000,
+            status=200,
+        )
+        second = capture.capture_source(
+            kind="BINANCE_KLINES_REST",
+            url="https://fapi.binance.com/fapi/v1/klines",
+            query_json=query,
+            raw_body=body,
+            requested_at_ms=now_ms - 3_000,
+            received_at_ms=now_ms - 2_000,
+            status=200,
+        )
+        return first, second
+
+    first_sources = bar_sources(0, 59_999, 1_000)
+    second_sources = bar_sources(60_000, 119_999, 2_000)
+    first_bar = collector._make_closed_kline(key, 0, 59_999, 100, 101, 99, 100, 10, 1_000, 5, 500)
+    second_bar = collector._make_closed_kline(key, 60_000, 119_999, 100, 102, 99, 101, 20, 2_000, 10, 1_000)
+    assert first_bar is not None and second_bar is not None
+    collector._promote_closed_kline(key, first_bar)
+    collector._native_bar_sources[key][59_999] = (first_sources, now_ms - 2_000)
+
+    depth_id = capture.capture_source(
+        kind="BINANCE_WS_FRAME",
+        url=f"wss://fstream.binance.com/public/stream?streams={key}@depth10@100ms",
+        raw_body=b"depth-frame",
+        received_at_ms=now_ms - 1_000,
+        route="public",
+        stream_epoch="1" * 32,
+        defer_persist=True,
+    )
+    funding_id = capture.capture_source(
+        kind="BINANCE_WS_FRAME",
+        url=f"wss://fstream.binance.com/market/stream?streams={key}@markPrice@1s",
+        raw_body=b"funding-frame",
+        received_at_ms=now_ms - 1_000,
+        route="market",
+        stream_epoch="2" * 32,
+        defer_persist=True,
+    )
+    oi_id = capture.capture_source(
+        kind="BINANCE_OPEN_INTEREST_REST",
+        url="https://fapi.binance.com/futures/data/openInterestHist",
+        query_json='{"limit":"13","period":"5m","symbol":"BTCUSDT"}',
+        raw_body=b"[]",
+        requested_at_ms=now_ms - 2_000,
+        received_at_ms=now_ms - 1_000,
+        status=200,
+    )
+    collector._native_latest_sources[key] = {
+        "depth": depth_id,
+        "funding": funding_id,
+        "open_interest": oi_id,
+    }
+
+    class RecordingBus:
+        def __init__(self) -> None:
+            self.messages: list[tuple[str, object]] = []
+
+        async def publish(self, topic: str, event: object) -> None:
+            self.messages.append((topic, event))
+
+    bus = RecordingBus()
+    service.bus = bus  # type: ignore[assignment]
+    injected = False
+
+    async def yield_and_promote(delay: float) -> None:
+        nonlocal injected
+        assert delay == 0
+        if not injected:
+            collector._promote_closed_kline(key, second_bar)
+            collector._native_bar_sources[key][119_999] = (second_sources, now_ms - 1_000)
+            injected = True
+
+    monkeypatch.setattr(service_module, "asyncio", SimpleNamespace(sleep=yield_and_promote))
+    await service._emit_once()
+
+    assert [topic for topic, _ in bus.messages] == [Topics.CLOSED_BAR]
+    assert collector.pending_closed_klines(key) == (second_bar,)
+    assert not any(
+        json.loads(record).get("event_kind") == "MARKET_SNAPSHOT" for record in sink.records.values()
+    )
+
+    await service._emit_once()
+    topics = [topic for topic, _ in bus.messages]
+    assert topics == [Topics.CLOSED_BAR, Topics.CLOSED_BAR, Topics.MARKET_SNAPSHOT]
+    snapshot = bus.messages[-1][1]
+    assert snapshot.volume_usd == 2_000
+    snapshot_records = [
+        json.loads(record)
+        for record in sink.records.values()
+        if json.loads(record).get("event_kind") == "MARKET_SNAPSHOT"
+    ]
+    assert len(snapshot_records) == 1
+    assert len(snapshot_records[0]["parents"]["confirmed_bars"]) == 2
 
 
 @pytest.mark.asyncio

@@ -543,7 +543,13 @@ def _replay_market_snapshot(
         short_liq_usd=liquidation.short_usd,
         volume_usd=latest_bar["quote_volume"],
     )
-    expected = MarketSnapshot.model_validate(dict(event_payload)).model_dump(mode="json")
+    try:
+        original_event = MarketSnapshot.model_validate(dict(event_payload))
+        expected = original_event.model_dump(mode="json")
+    except Exception as exc:
+        raise NativeQuantSourceCaptureFailure("captured full market-snapshot DTO is invalid") from exc
+    if canonical_json_bytes(expected) != canonical_json_bytes(event_payload):
+        raise NativeQuantSourceCaptureFailure("captured full market-snapshot DTO is not canonical")
     replay_payload = replayed.model_dump(mode="json")
     domain_fields = (
         "source",
@@ -562,7 +568,10 @@ def _replay_market_snapshot(
         raise NativeQuantSourceCaptureFailure(
             "existing SnapshotBuilder did not reproduce the captured output"
         )
-    return replay_payload
+    # Replay proves the economic fields above; metadata such as message_id and
+    # produced_at must remain the exact validated values from the persisted
+    # output. Rebuilding those fields here would silently mint/retime a DTO.
+    return expected
 
 
 def _stream_route_matches(record: Mapping[str, Any], *, route: str, symbol: str, suffix: str) -> bool:
@@ -648,7 +657,9 @@ def _apply_open_interest(collector: BinanceFuturesCollector, record: Mapping[str
     if not values[0] or not values[-1]:
         raise NativeQuantSourceCaptureFailure("open-interest window contains zero baseline")
     collector.open_interest[symbol.lower()] = values[-1]
-    collector.oi_change_pct_1h[symbol.lower()] = (values[-1] - values[0]) / values[0] * 100.0
+    # Match the collector's exact operation ordering: floating-point
+    # reassociation can change the final bit and make genuine output fail replay.
+    collector.oi_change_pct_1h[symbol.lower()] = collector._pct_change(values[0], values[-1])
 
 
 __all__ = ["replay_native_quant_event"]
