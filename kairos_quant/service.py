@@ -8,7 +8,7 @@ import math
 import time
 from collections.abc import Iterable, Mapping
 from dataclasses import asdict
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import aiohttp
 from kairos_core.bus import build_bus
@@ -34,6 +34,9 @@ from .venue_poll import (
 
 log = get_logger("quant-scouts")
 
+if TYPE_CHECKING:
+    from .native_capture import NativeQuantCapture
+
 _ONE_MINUTE_MS = 60_000
 
 
@@ -54,8 +57,16 @@ def _advance_fixed_rate_deadline(
 
 
 class QuantScoutsService:
-    def __init__(self, settings: QuantSettings | None = None) -> None:
+    def __init__(
+        self,
+        settings: QuantSettings | None = None,
+        *,
+        native_capture: NativeQuantCapture | None = None,
+    ) -> None:
         self.settings = settings or QuantSettings()
+        self.native_capture = native_capture
+        if native_capture is not None and self.settings.enable_venue_quality_gate:
+            raise ValueError("native source capture scope excludes EVEDEX venue polling")
         transport = build_bus(self.settings)
         self.bus = (
             transport
@@ -74,8 +85,15 @@ class QuantScoutsService:
             kline_buffer_size=self.settings.price_window,
             kline_finality_delay_s=self.settings.kline_finality_delay_s,
             max_exchange_future_skew_s=self.settings.maximum_binance_future_skew_ms / 1_000,
+            native_capture=native_capture,
         )
         self._last_kline_close_time_ms: dict[str, int] = {}
+        self._native_bar_history: dict[str, list[str]] = {
+            symbol.upper(): [] for symbol in self.settings.symbols
+        }
+        self._native_history_complete: dict[str, bool] = {
+            symbol.upper(): True for symbol in self.settings.symbols
+        }
         self.venue_gate_policy = VenueGatePolicy(
             assessed_notional_usd=self.settings.venue_quality_notional_usd,
             maximum_abs_basis_bps=self.settings.maximum_abs_basis_bps,
@@ -113,6 +131,7 @@ class QuantScoutsService:
     def _restore_closed_bar_payloads(self, payloads: Iterable[object]) -> None:
         """Restore the producer's last immutable window without republishing it."""
 
+        restored_any = False
         for raw_payload in payloads:
             payload: Any = raw_payload
             if isinstance(payload, str):
@@ -137,10 +156,26 @@ class QuantScoutsService:
                 taker_buy_quote_volume=event.taker_buy_quote_volume,
             )
             if self.collector.restore_closed_kline(candle):
+                restored_any = True
                 self.builder.push_candle(
                     event.symbol.upper(), high=event.high, low=event.low, close=event.close
                 )
                 self._last_kline_close_time_ms[event.symbol.lower()] = event.close_time_ms
+        if self.native_capture is not None and restored_any:
+            for symbol in self._native_history_complete:
+                self._native_history_complete[symbol] = False
+
+    def _native_replay_profile(self) -> dict[str, int]:
+        return {
+            "price_window": self.settings.price_window,
+            "depth_levels": self.settings.depth_levels,
+            "snapshot_interval_ms": math.ceil(self.settings.snapshot_interval_s * 1_000),
+            "kline_finality_delay_ms": math.ceil(self.settings.kline_finality_delay_s * 1_000),
+            "maximum_binance_future_skew_ms": self.settings.maximum_binance_future_skew_ms,
+            "book_stale_after_ms": math.ceil(self.settings.book_stale_after_s * 1_000),
+            "kline_stale_after_ms": math.ceil(self.settings.kline_stale_after_s * 1_000),
+            "derivatives_stale_after_ms": math.ceil(self.settings.derivatives_stale_after_s * 1_000),
+        }
 
     async def _restore_closed_bars(self) -> None:
         if not isinstance(self.bus, DurableMessageBus):
@@ -208,6 +243,17 @@ class QuantScoutsService:
             # driven by final bars, while entry permission is decided later by the
             # EVEDEX venue-quality gate.
             for kline in self.collector.pending_closed_klines(key):
+                previous_close_time_ms = self._last_kline_close_time_ms.get(key)
+                resets_builder = (
+                    previous_close_time_ms is not None
+                    and kline.close_time_ms - previous_close_time_ms != _ONE_MINUTE_MS
+                )
+                if (
+                    self.native_capture is not None
+                    and not resets_builder
+                    and len(self._native_bar_history[symbol]) >= 2_000
+                ):
+                    raise PermissionError("native Quant replay prefix exceeded its fixed bound")
                 event = ClosedBarEventV1(
                     source=self.settings.service_name,
                     symbol=kline.symbol,
@@ -223,17 +269,34 @@ class QuantScoutsService:
                     taker_buy_base_volume=kline.taker_buy_base_volume,
                     taker_buy_quote_volume=kline.taker_buy_quote_volume,
                 )
+                if self.native_capture is not None:
+                    lineage = self.collector.native_bar_lineage(key, kline.close_time_ms)
+                    if lineage is None:
+                        raise PermissionError("native confirmed-bar source lineage is unavailable")
+                    raw_confirmation_ids, _source_received_at_ms = lineage
+                    bar_capture_id = self.native_capture.capture_derived_payload(
+                        event_kind="CLOSED_BAR",
+                        event_id=str(event.bar_sha256),
+                        event_payload=event.model_dump(mode="json"),
+                        # This is a new local capture/publication observation,
+                        # not a replacement for the source clock retained in
+                        # the second REST parent record above.
+                        output_observed_at_ms=int(time.time() * 1_000),
+                        parents={"rest_confirmations": raw_confirmation_ids},
+                        replay_profile=self._native_replay_profile(),
+                    )
                 await self.bus.publish(Topics.CLOSED_BAR, event)
                 self.collector.acknowledge_closed_klines(key, 1)
-                previous_close_time_ms = self._last_kline_close_time_ms.get(key)
                 if previous_close_time_ms == kline.close_time_ms:
                     continue
-                if (
-                    previous_close_time_ms is not None
-                    and kline.close_time_ms - previous_close_time_ms != _ONE_MINUTE_MS
-                ):
+                if resets_builder:
                     self.builder.reset(symbol)
+                    self._native_bar_history[symbol].clear()
+                    self._native_history_complete[symbol] = True
                 self.builder.push_candle(symbol, high=kline.high, low=kline.low, close=kline.close)
+                if self.native_capture is not None:
+                    history = self._native_bar_history[symbol]
+                    history.append(bar_capture_id)
                 self._last_kline_close_time_ms[key] = kline.close_time_ms
 
             book = self.collector.books.get(key, {"bids": [], "asks": []})
@@ -263,8 +326,38 @@ class QuantScoutsService:
                 short_liq_usd=liquidations.short_usd,
                 volume_usd=self.collector.volume_usd.get(key, 0.0),
             )
+            native_force_ids: tuple[str, ...] = ()
+            if self.native_capture is not None:
+                source_depth = self.collector.native_source_id(key, "depth")
+                source_funding = self.collector.native_source_id(key, "funding")
+                source_oi = self.collector.native_source_id(key, "open_interest")
+                native_force_ids = self.collector.native_force_source_ids(key)
+                confirmed_bars = tuple(self._native_bar_history[symbol])
+                if (
+                    source_depth is None
+                    or source_funding is None
+                    or source_oi is None
+                    or not confirmed_bars
+                    or not self._native_history_complete[symbol]
+                ):
+                    raise PermissionError("native Quant snapshot is missing one or more exact source parents")
+                parents: dict[str, str | tuple[str, ...]] = {
+                    "depth_frame": source_depth,
+                    "funding_source": source_funding,
+                    "open_interest_source": source_oi,
+                    "force_order_frames": native_force_ids,
+                    "confirmed_bars": confirmed_bars,
+                }
+                self.native_capture.capture_derived_event(
+                    event_kind="MARKET_SNAPSHOT",
+                    event=snapshot,
+                    parents=parents,
+                    replay_profile=self._native_replay_profile(),
+                )
             await self.bus.publish(Topics.MARKET_SNAPSHOT, snapshot)
             self.collector.acknowledge_liquidations(key, liquidations)
+            if self.native_capture is not None:
+                self.collector.acknowledge_native_force_source_ids(key, native_force_ids)
             log.info(
                 "snapshot",
                 symbol=snapshot.symbol,

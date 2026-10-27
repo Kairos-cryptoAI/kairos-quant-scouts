@@ -12,9 +12,11 @@ import json
 import math
 import re
 import time
+import uuid
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 import aiohttp
 from kairos_core.logging import get_logger
@@ -22,6 +24,9 @@ from kairos_core.logging import get_logger
 from ..orderbook import normalize_order_book
 from ..simulation_book import SimulationBookTapeBlocked, SimulationBookTapeRecorder
 from ..stream_routes import STREAM_ROUTES, StreamRoute, websocket_root
+
+if TYPE_CHECKING:
+    from ..native_capture import NativeQuantCapture
 
 log = get_logger("quant-scouts.binance")
 
@@ -31,6 +36,16 @@ _OPEN_INTEREST_PERIOD_MS = 5 * _ONE_MINUTE_MS
 _OPEN_INTEREST_MAX_SOURCE_LAG_MS = 2 * _OPEN_INTEREST_PERIOD_MS
 _LIQUIDATION_DEDUP_SIZE = 10_000
 _REST_CONFIRMATIONS_REQUIRED = 2
+_MAX_NATIVE_RESPONSE_BYTES = 1_000_000
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +85,7 @@ class BinanceFuturesCollector:
         clock: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], float] = time.time,
         simulation_book_recorder: SimulationBookTapeRecorder | None = None,
+        native_capture: NativeQuantCapture | None = None,
     ) -> None:
         if reconnect_initial_s <= 0 or reconnect_max_s < reconnect_initial_s:
             raise ValueError("invalid reconnect backoff")
@@ -94,6 +110,12 @@ class BinanceFuturesCollector:
         self._kline_finality_delay_ms = math.ceil(kline_finality_delay_s * 1_000)
         self._max_exchange_future_skew_s = max_exchange_future_skew_s
         self._simulation_book_recorder = simulation_book_recorder
+        self._native_capture = native_capture
+        if native_capture is not None and (
+            self.rest_base != "https://fapi.binance.com" or self.ws_base != "wss://fstream.binance.com"
+        ):
+            raise ValueError("native source capture requires the exact official Binance UM origins")
+        self._native_stream_epochs: dict[StreamRoute, str] = {}
 
         self.books: dict[str, dict[str, list[Level]]] = {
             symbol: {"bids": [], "asks": []} for symbol in self.symbols
@@ -110,9 +132,9 @@ class BinanceFuturesCollector:
         self._ws_closed_candidates: dict[str, dict[int, ClosedKline]] = {
             symbol: {} for symbol in self.symbols
         }
-        self._rest_closed_candidates: dict[str, dict[int, tuple[ClosedKline, int]]] = {
-            symbol: {} for symbol in self.symbols
-        }
+        self._rest_closed_candidates: dict[
+            str, dict[int, tuple[ClosedKline, int, str | None, int | None, int | None]]
+        ] = {symbol: {} for symbol in self.symbols}
         self._needs_kline_backfill: set[str] = set()
         self._known_klines: dict[str, dict[int, ClosedKline]] = {symbol: {} for symbol in self.symbols}
         self._kline_integrity_error: dict[str, str | None] = dict.fromkeys(self.symbols)
@@ -131,6 +153,11 @@ class BinanceFuturesCollector:
         self._seen_liquidations: set[tuple[str, int, str, float, float]] = set()
         self._liquidation_order: deque[tuple[str, int, str, float, float]] = deque()
         self._kline_refresh_lock = asyncio.Lock()
+        self._native_latest_sources: dict[str, dict[str, str]] = {symbol: {} for symbol in self.symbols}
+        self._native_force_sources: dict[str, list[str]] = {symbol: [] for symbol in self.symbols}
+        self._native_bar_sources: dict[str, dict[int, tuple[tuple[str, str], int]]] = {
+            symbol: {} for symbol in self.symbols
+        }
 
     def _streams(self, route: StreamRoute) -> str:
         if route not in STREAM_ROUTES:
@@ -142,6 +169,9 @@ class BinanceFuturesCollector:
         return {
             route: f"{self.ws_base}/{route}/stream?streams={self._streams(route)}" for route in STREAM_ROUTES
         }
+
+    def _native_session_kwargs(self) -> dict[str, Any]:
+        return {"cookie_jar": aiohttp.DummyCookieJar()} if self._native_capture is not None else {}
 
     async def run(self) -> None:
         """Isolate public/market reconnects; fatal errors and cancellation close both."""
@@ -161,14 +191,23 @@ class BinanceFuturesCollector:
         backoff_s = self.reconnect_initial_s
         timeout = aiohttp.ClientTimeout(total=None, connect=15, sock_connect=15, sock_read=90)
 
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with aiohttp.ClientSession(timeout=timeout, **self._native_session_kwargs()) as session:
             while True:
                 received_data = False
                 simulation_public_stream_started = False
                 if route == "public":
                     self._invalidate_books()
+                stream_epoch = uuid.uuid4().hex
+                self._native_stream_epochs[route] = stream_epoch
+                for symbol in self.symbols:
+                    self._native_latest_sources[symbol].pop("depth" if route == "public" else "funding", None)
                 try:
-                    async with session.ws_connect(url, heartbeat=15, autoping=True) as ws:
+                    ws_options: dict[str, Any] = (
+                        {"max_msg_size": _MAX_NATIVE_RESPONSE_BYTES, "ssl": True}
+                        if self._native_capture is not None
+                        else {}
+                    )
+                    async with session.ws_connect(url, heartbeat=15, autoping=True, **ws_options) as ws:
                         log.info("binance.connected", route=route, symbols=self.symbols)
                         try:
                             if route == "public" and self._simulation_book_recorder is not None:
@@ -186,17 +225,46 @@ class BinanceFuturesCollector:
                                     try:
                                         raw_payload = message.data
                                         received_at_ms = int(self._wall_clock() * 1_000)
-                                        payload = json.loads(raw_payload)
+                                        source_capture_id = None
+                                        if self._native_capture is not None:
+                                            source_capture_id = self._native_capture.capture_source(
+                                                kind="BINANCE_WS_FRAME",
+                                                url=url,
+                                                raw_body=raw_payload.encode("utf-8"),
+                                                received_at_ms=received_at_ms,
+                                                route=route,
+                                                stream_epoch=stream_epoch,
+                                            )
+                                        payload = (
+                                            json.loads(
+                                                raw_payload, object_pairs_hook=_reject_duplicate_json_keys
+                                            )
+                                            if self._native_capture is not None
+                                            else json.loads(raw_payload)
+                                        )
                                         if not isinstance(payload, dict):
                                             raise ValueError("combined-stream payload must be an object")
                                         if self._simulation_book_recorder is None:
-                                            admitted = self._on_message(payload, route=route)
+                                            if self._native_capture is None:
+                                                admitted = self._on_message(payload, route=route)
+                                            else:
+                                                admitted = self._on_message(
+                                                    payload,
+                                                    route=route,
+                                                    native_source_id=source_capture_id,
+                                                )
                                         else:
+                                            capture_kwargs = (
+                                                {}
+                                                if self._native_capture is None
+                                                else {"native_source_id": source_capture_id}
+                                            )
                                             admitted = self._on_message(
                                                 payload,
                                                 route=route,
                                                 raw_payload=raw_payload,
                                                 received_at_ms=received_at_ms,
+                                                **capture_kwargs,
                                             )
                                         received_data = admitted or received_data
                                         if admitted and route == "market" and self._gap_backfill_due():
@@ -252,6 +320,7 @@ class BinanceFuturesCollector:
         route: StreamRoute | None = None,
         raw_payload: str | None = None,
         received_at_ms: int | None = None,
+        native_source_id: str | None = None,
     ) -> bool:
         stream = message.get("stream", "")
         routes = STREAM_ROUTES if route is None else (route,)
@@ -301,6 +370,8 @@ class BinanceFuturesCollector:
                     bids=bids,
                     asks=asks,
                 )
+            if native_source_id is not None:
+                self._native_latest_sources[symbol]["depth"] = native_source_id
             self.books[symbol] = {"bids": bids, "asks": asks}
             self._last_book_update_id[symbol] = update_id
             self._book_event_time_ms[symbol] = event_time_ms
@@ -317,17 +388,24 @@ class BinanceFuturesCollector:
                 or (previous_event_time_ms is not None and event_time_ms <= previous_event_time_ms)
             ):
                 return False
+            if native_source_id is not None:
+                self._native_latest_sources[symbol]["funding"] = native_source_id
             self.funding[symbol] = funding
             self._funding_event_time_ms[symbol] = event_time_ms
             self._funding_updated_at[symbol] = self._clock()
             return True
         elif "@kline_1m" in stream_lower:
-            return self._on_kline(symbol, data)
+            return self._on_kline(symbol, data, native_source_id=native_source_id)
         elif "@forceorder" in stream_lower:
-            return self._on_liquidation(symbol, data)
+            if native_source_id is not None and len(self._native_force_sources[symbol]) >= 2_000:
+                raise PermissionError("native force-order lineage budget is exhausted")
+            admitted = self._on_liquidation(symbol, data)
+            if admitted and native_source_id is not None:
+                self._native_force_sources[symbol].append(native_source_id)
+            return admitted
         return False
 
-    def _on_kline(self, symbol: str, data: dict) -> bool:
+    def _on_kline(self, symbol: str, data: dict, *, native_source_id: str | None = None) -> bool:
         kline = data.get("k", {})
         if not isinstance(kline, dict) or kline.get("x") is not True:
             return False
@@ -377,6 +455,8 @@ class BinanceFuturesCollector:
             return False
         candidates = self._ws_closed_candidates[symbol]
         previous = candidates.get(candle.close_time_ms)
+        if native_source_id is not None:
+            self._native_latest_sources[symbol]["kline_ws"] = native_source_id
         candidates[candle.close_time_ms] = candle
         while len(candidates) > self._kline_buffer_size:
             candidates.pop(min(candidates))
@@ -518,6 +598,70 @@ class BinanceFuturesCollector:
                 0.0, self._short_liquidations_usd[key] - published.short_usd
             )
 
+    def native_source_id(self, symbol: str, source: str) -> str | None:
+        """Return the exact persisted input currently backing a collector value."""
+        return self._native_latest_sources.get(symbol.lower(), {}).get(source)
+
+    def native_force_source_ids(self, symbol: str) -> tuple[str, ...]:
+        return tuple(self._native_force_sources.get(symbol.lower(), ()))
+
+    def acknowledge_native_force_source_ids(self, symbol: str, source_ids: tuple[str, ...]) -> None:
+        key = symbol.lower()
+        sources = self._native_force_sources.get(key)
+        if sources is None or tuple(sources[: len(source_ids)]) != source_ids:
+            raise PermissionError("native force-order lineage changed before acknowledgement")
+        del sources[: len(source_ids)]
+
+    def native_bar_lineage(self, symbol: str, close_time_ms: int) -> tuple[tuple[str, str], int] | None:
+        return self._native_bar_sources.get(symbol.lower(), {}).get(close_time_ms)
+
+    def _require_native_session_policy(self, session: aiohttp.ClientSession) -> None:
+        if self._native_capture is None:
+            return
+        headers = getattr(session, "headers", {})
+        forbidden = {
+            "authorization",
+            "proxy-authorization",
+            "cookie",
+            "x-mbx-apikey",
+        }
+        if (
+            getattr(session, "trust_env", False)
+            or getattr(session, "auth", None) is not None
+            or getattr(session, "_default_auth", None) is not None
+            or getattr(session, "_default_proxy", None) is not None
+            or getattr(session, "_default_proxy_auth", None) is not None
+            or any(str(key).lower() in forbidden for key in headers)
+            or getattr(session, "_middlewares", ())
+        ):
+            raise PermissionError("native capture requires credential-free direct REST sessions")
+        cookie_jar = getattr(session, "cookie_jar", None)
+        if cookie_jar is not None and cookie_jar.filter_cookies("https://fapi.binance.com"):
+            raise PermissionError("native capture forbids stored REST cookies")
+
+    async def _read_native_response(self, response: aiohttp.ClientResponse) -> bytes:
+        declared_size = response.headers.get("Content-Length")
+        if declared_size is not None:
+            try:
+                if int(declared_size) > _MAX_NATIVE_RESPONSE_BYTES:
+                    raise PermissionError("native Binance response exceeds its fixed byte bound")
+            except ValueError as exc:
+                raise PermissionError("native Binance response has an invalid content length") from exc
+        content_encoding = response.headers.get("Content-Encoding", "identity").lower()
+        if content_encoding not in {"", "identity"}:
+            raise PermissionError("native capture requires uncompressed source response bytes")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = await response.content.read(min(64 * 1024, _MAX_NATIVE_RESPONSE_BYTES + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > _MAX_NATIVE_RESPONSE_BYTES:
+                raise PermissionError("native Binance response exceeds its fixed byte bound")
+        return b"".join(chunks)
+
     def is_book_fresh(self, symbol: str, max_age_s: float) -> bool:
         key = symbol.lower()
         return self._is_fresh(self._book_updated_at.get(key), max_age_s) and self._exchange_time_is_fresh(
@@ -555,21 +699,60 @@ class BinanceFuturesCollector:
         """Refresh the latest open interest for every configured symbol."""
         if session is None:
             timeout = aiohttp.ClientTimeout(total=15)
-            async with aiohttp.ClientSession(timeout=timeout) as owned_session:
+            async with aiohttp.ClientSession(
+                timeout=timeout, **self._native_session_kwargs()
+            ) as owned_session:
                 await self._refresh_open_interest(owned_session)
             return
         await self._refresh_open_interest(session)
 
     async def _refresh_open_interest(self, session: aiohttp.ClientSession) -> None:
+        self._require_native_session_policy(session)
         for symbol in self.symbols:
             url = f"{self.rest_base}/futures/data/openInterestHist"
+            params: dict[str, str | int] = {"symbol": symbol.upper(), "period": "5m", "limit": 13}
             try:
-                async with session.get(
-                    url,
-                    params={"symbol": symbol.upper(), "period": "5m", "limit": 13},
-                ) as response:
+                requested_at_ms = (
+                    int(self._wall_clock() * 1_000) if self._native_capture is not None else None
+                )
+                request = (
+                    session.get(url, params=params)
+                    if self._native_capture is None
+                    else session.get(
+                        url,
+                        params=params,
+                        allow_redirects=False,
+                        headers={"Accept-Encoding": "identity"},
+                        auto_decompress=False,
+                        ssl=True,
+                    )
+                )
+                async with request as response:
+                    source_id: str | None = None
+                    if self._native_capture is not None:
+                        raw_body = await self._read_native_response(response)
+                        received_at_ms = int(self._wall_clock() * 1_000)
+                        source_id = self._native_capture.capture_source(
+                            kind="BINANCE_OPEN_INTEREST_REST",
+                            url=url,
+                            query_json=json.dumps(
+                                {key: str(value) for key, value in params.items()},
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ),
+                            raw_body=raw_body,
+                            requested_at_ms=requested_at_ms,
+                            received_at_ms=received_at_ms,
+                            status=response.status,
+                        )
+                        body: object = (
+                            json.loads(raw_body, object_pairs_hook=_reject_duplicate_json_keys)
+                            if response.status == 200
+                            else None
+                        )
+                    else:
+                        body = await response.json() if response.status == 200 else None
                     if response.status == 200:
-                        body = await response.json()
                         if isinstance(body, list):
                             records = [item for item in body if isinstance(item, dict)]
                             records = records[-13:]
@@ -602,6 +785,8 @@ class BinanceFuturesCollector:
                                 else -1
                             )
                             if has_hour_window and 0 <= source_age_ms <= _OPEN_INTEREST_MAX_SOURCE_LAG_MS:
+                                if source_id is not None:
+                                    self._native_latest_sources[symbol]["open_interest"] = source_id
                                 self.open_interest[symbol] = values[-1]
                                 self.oi_change_pct_1h[symbol] = self._pct_change(values[0], values[-1])
                                 self._open_interest_updated_at[symbol] = self._clock()
@@ -624,7 +809,7 @@ class BinanceFuturesCollector:
             raise ValueError("open-interest interval must be positive")
 
         timeout = aiohttp.ClientTimeout(total=15)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with aiohttp.ClientSession(timeout=timeout, **self._native_session_kwargs()) as session:
             while True:
                 try:
                     await self.refresh_open_interest(session)
@@ -641,19 +826,53 @@ class BinanceFuturesCollector:
 
         if session is None:
             timeout = aiohttp.ClientTimeout(total=15)
-            async with aiohttp.ClientSession(timeout=timeout) as owned_session:
+            async with aiohttp.ClientSession(
+                timeout=timeout, **self._native_session_kwargs()
+            ) as owned_session:
                 await self._refresh_funding(owned_session)
             return
         await self._refresh_funding(session)
 
     async def _refresh_funding(self, session: aiohttp.ClientSession) -> None:
+        self._require_native_session_policy(session)
         url = f"{self.rest_base}/fapi/v1/premiumIndex"
         try:
-            async with session.get(url) as response:
+            requested_at_ms = int(self._wall_clock() * 1_000) if self._native_capture is not None else None
+            request = (
+                session.get(url)
+                if self._native_capture is None
+                else session.get(
+                    url,
+                    allow_redirects=False,
+                    headers={"Accept-Encoding": "identity"},
+                    auto_decompress=False,
+                    ssl=True,
+                )
+            )
+            async with request as response:
+                source_id: str | None = None
+                if self._native_capture is not None:
+                    raw_body = await self._read_native_response(response)
+                    received_at_ms = int(self._wall_clock() * 1_000)
+                    source_id = self._native_capture.capture_source(
+                        kind="BINANCE_PREMIUM_INDEX_REST",
+                        url=url,
+                        query_json="{}",
+                        raw_body=raw_body,
+                        requested_at_ms=requested_at_ms,
+                        received_at_ms=received_at_ms,
+                        status=response.status,
+                    )
+                    body: object = (
+                        json.loads(raw_body, object_pairs_hook=_reject_duplicate_json_keys)
+                        if response.status == 200
+                        else None
+                    )
+                else:
+                    body = await response.json() if response.status == 200 else None
                 if response.status != 200:
                     log.warning("binance.funding_failed", status=response.status)
                     return
-                body = await response.json()
                 records = body if isinstance(body, list) else [body]
                 for item in records:
                     if not isinstance(item, dict):
@@ -671,6 +890,8 @@ class BinanceFuturesCollector:
                         or (previous_event_time_ms is not None and event_time_ms <= previous_event_time_ms)
                     ):
                         continue
+                    if source_id is not None:
+                        self._native_latest_sources[symbol]["funding"] = source_id
                     self.funding[symbol] = funding
                     self._funding_event_time_ms[symbol] = event_time_ms
                     self._funding_updated_at[symbol] = self._clock()
@@ -681,7 +902,7 @@ class BinanceFuturesCollector:
         if interval_s <= 0:
             raise ValueError("funding interval must be positive")
         timeout = aiohttp.ClientTimeout(total=15)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with aiohttp.ClientSession(timeout=timeout, **self._native_session_kwargs()) as session:
             while True:
                 try:
                     await self.refresh_funding(session)
@@ -697,7 +918,7 @@ class BinanceFuturesCollector:
         if interval_s <= 0:
             raise ValueError("kline reconciliation interval must be positive")
         timeout = aiohttp.ClientTimeout(total=15)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with aiohttp.ClientSession(timeout=timeout, **self._native_session_kwargs()) as session:
             while True:
                 await asyncio.sleep(interval_s)
                 try:
@@ -714,20 +935,61 @@ class BinanceFuturesCollector:
             await self._refresh_klines(session)
 
     async def _refresh_klines(self, session: aiohttp.ClientSession) -> None:
+        self._require_native_session_policy(session)
         for symbol in self.symbols:
             # Record attempts, including failures, so a persistent gap cannot turn
             # high-frequency depth traffic into an unbounded REST retry loop.
-            self._last_kline_backfill_at[symbol] = self._clock()
+            if self._native_capture is None:
+                self._last_kline_backfill_at[symbol] = self._clock()
             url = f"{self.rest_base}/fapi/v1/klines"
+            params: dict[str, str | int] = {
+                "symbol": symbol.upper(),
+                "interval": "1m",
+                "limit": min(self._kline_buffer_size, 1_500),
+            }
             try:
-                async with session.get(
-                    url,
-                    params={
-                        "symbol": symbol.upper(),
-                        "interval": "1m",
-                        "limit": min(self._kline_buffer_size, 1_500),
-                    },
-                ) as response:
+                requested_at_ms = (
+                    int(self._wall_clock() * 1_000) if self._native_capture is not None else None
+                )
+                request = (
+                    session.get(url, params=params)
+                    if self._native_capture is None
+                    else session.get(
+                        url,
+                        params=params,
+                        allow_redirects=False,
+                        headers={"Accept-Encoding": "identity"},
+                        auto_decompress=False,
+                        ssl=True,
+                    )
+                )
+                async with request as response:
+                    response_capture_id: str | None = None
+                    response_received_at_ms: int | None = None
+                    if self._native_capture is not None:
+                        raw_body = await self._read_native_response(response)
+                        response_received_at_ms = int(self._wall_clock() * 1_000)
+                        response_capture_id = self._native_capture.capture_source(
+                            kind="BINANCE_KLINES_REST",
+                            url=url,
+                            query_json=json.dumps(
+                                {key: str(value) for key, value in params.items()},
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ),
+                            raw_body=raw_body,
+                            requested_at_ms=requested_at_ms,
+                            received_at_ms=response_received_at_ms,
+                            status=response.status,
+                        )
+                        body: object = (
+                            json.loads(raw_body, object_pairs_hook=_reject_duplicate_json_keys)
+                            if response.status == 200
+                            else None
+                        )
+                        self._last_kline_backfill_at[symbol] = self._clock()
+                    else:
+                        body = await response.json() if response.status == 200 else None
                     if response.status != 200:
                         log.warning(
                             "binance.kline_backfill_failed",
@@ -735,7 +997,6 @@ class BinanceFuturesCollector:
                             status=response.status,
                         )
                         continue
-                    body = await response.json()
                     if not isinstance(body, list):
                         continue
                     # Evaluate closure after the awaited response so a candle that
@@ -786,8 +1047,16 @@ class BinanceFuturesCollector:
                                 )
                             )
                     for values in sorted(closed_klines, key=lambda item: item[1]):
-                        self._observe_rest_closed_kline(symbol, *values)
+                        self._observe_rest_closed_kline(
+                            symbol,
+                            *values,
+                            native_source_id=response_capture_id,
+                            source_received_at_ms=response_received_at_ms,
+                            source_requested_at_ms=requested_at_ms,
+                        )
             except (TimeoutError, aiohttp.ClientError, TypeError, ValueError) as exc:
+                if self._native_capture is not None:
+                    self._last_kline_backfill_at[symbol] = self._clock()
                 log.warning(
                     "binance.kline_backfill_error",
                     symbol=symbol.upper(),
@@ -838,6 +1107,10 @@ class BinanceFuturesCollector:
         quote_volume: float,
         taker_buy_base_volume: float,
         taker_buy_quote_volume: float,
+        *,
+        native_source_id: str | None = None,
+        source_received_at_ms: int | None = None,
+        source_requested_at_ms: int | None = None,
     ) -> bool:
         candle = self._make_closed_kline(
             symbol=symbol.upper(),
@@ -861,15 +1134,39 @@ class BinanceFuturesCollector:
         candidates = self._rest_closed_candidates[symbol]
         previous = candidates.get(close_time_ms)
         if previous is None or previous[0] != candle:
-            candidates[close_time_ms] = (candle, 1)
+            candidates[close_time_ms] = (
+                candle,
+                1,
+                native_source_id,
+                source_received_at_ms,
+                source_requested_at_ms,
+            )
             while len(candidates) > self._kline_buffer_size:
                 candidates.pop(min(candidates))
             return False
         confirmations = previous[1] + 1
+        if native_source_id is not None and (
+            previous[2] == native_source_id
+            or type(previous[3]) is not int
+            or type(source_requested_at_ms) is not int
+            or previous[3] > source_requested_at_ms
+        ):
+            return False
         if confirmations < _REST_CONFIRMATIONS_REQUIRED:
-            candidates[close_time_ms] = (candle, confirmations)
+            candidates[close_time_ms] = (
+                candle,
+                confirmations,
+                previous[2],
+                previous[3],
+                previous[4],
+            )
             return False
         candidates.pop(close_time_ms, None)
+        if native_source_id is not None and previous[2] is not None and source_received_at_ms is not None:
+            self._native_bar_sources[symbol][close_time_ms] = (
+                (previous[2], native_source_id),
+                source_received_at_ms,
+            )
 
         ws_candle = self._ws_closed_candidates[symbol].pop(close_time_ms, None)
         if ws_candle is not None and ws_candle != candle:

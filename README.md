@@ -195,6 +195,27 @@ PostgreSQL outbox before dispatch. Configure `KAIROS_PERSISTENCE_DATABASE_URL`
 through the deployment secret provider. The in-memory backend intentionally
 bypasses persistence and is limited to local tests.
 
+## Opt-in native source capture
+
+`QuantScoutsService(settings, native_capture=...)` optionally accepts a
+synchronous create-only sink adapter. The default constructor remains unchanged
+and writes no capture records. Capture mode is restricted to the fixed public
+Binance USD-M origins, verified TLS, no redirects, no credentials/cookies/proxy
+defaults, and bounded source bodies. It records exact REST response entities and
+original WebSocket text before parsing. Sink or source-bound failures propagate
+and prevent the corresponding new derived event from being published.
+
+Raw records use `kairos.quant-source-capture.v1`; derived closed-bar and market
+snapshot records use `kairos.quant-derived-market-event.v1`. Raw records identify
+only public bytes and local receipt metadata; derived records bind the exact
+published DTO to its actual parents and captured Quant replay settings. They are
+not signed, registered, or producer authority, and do not authenticate Binance or
+prove that force-order/depth feeds are complete. A snapshot replay requires every
+confirmed-bar record since the builder reset plus all original inputs; incomplete
+or restarted history is refused rather than reconstructed from a truncated
+rolling window. The pure offline entrypoint is
+`kairos_quant.native_replay.replay_native_quant_event`.
+
 ---
 
 Part of the [Kairos](https://github.com/Kairos-cryptoAI/kairos) system. MIT licensed.
