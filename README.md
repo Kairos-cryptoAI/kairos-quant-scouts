@@ -152,6 +152,12 @@ symbol on `kairos.venue.poll.v1`; after the quality measurement is durable it pe
 from the latest durable interval and symbol-set fingerprint, so latency, failures,
 process downtime and configuration changes cannot inflate venue availability.
 
+The pure `build_venue_quality` calculation also accepts an explicit
+`profile=EvedexProfile.PROD` for already-captured books, but only for the fixed
+unsuffixed Binance-to-EVEDEX symbol mapping. Its default remains DEV, and this
+calculation does not fetch or qualify sources, convert a DEV observation into PROD,
+or grant execution authority.
+
 ## Local development
 
 Install [uv](https://docs.astral.sh/uv/) once. The repository pins uv 0.12.3,

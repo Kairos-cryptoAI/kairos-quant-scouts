@@ -6,6 +6,7 @@ import asyncio
 import math
 import time
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any
 
 import aiohttp
@@ -63,6 +64,42 @@ def evedex_dev_symbol(binance_symbol: str) -> str:
     return f"{normalized[:-4]}USD:DEV"
 
 
+PROD_SYMBOL_MAP = MappingProxyType(
+    {
+        "BTCUSDT": "BTCUSD",
+        "ETHUSDT": "ETHUSD",
+        "SOLUSDT": "SOLUSD",
+        "BNBUSDT": "BNBUSD",
+        "XRPUSDT": "XRPUSD",
+    }
+)
+
+
+def _validate_book_pair(
+    *,
+    binance: BookSnapshot,
+    evedex: BookSnapshot,
+    venue_symbol: str,
+    profile: EvedexProfile,
+) -> None:
+    if type(profile) is not EvedexProfile:
+        raise ValueError("venue quality profile must be an explicit EvedexProfile enum")
+    if profile not in (EvedexProfile.DEV, EvedexProfile.PROD):
+        raise ValueError("runtime venue quality supports only explicit DEV or PROD profiles")
+    if binance.source != "binance" or evedex.source != "evedex":
+        raise ValueError("venue books were supplied in the wrong order")
+    if profile is EvedexProfile.DEV:
+        return
+    if not isinstance(binance.symbol, str) or not isinstance(evedex.symbol, str):
+        raise ValueError("venue book symbols must be strings")
+    signal_symbol = binance.symbol.strip().upper()
+    if binance.symbol != signal_symbol or signal_symbol not in PROD_SYMBOL_MAP:
+        raise ValueError("Binance book symbol must be an exact approved USDT signal symbol")
+    expected_symbol = PROD_SYMBOL_MAP[signal_symbol]
+    if venue_symbol != expected_symbol or evedex.symbol != expected_symbol:
+        raise ValueError("EVEDEX book and requested venue symbol must match the exact profile mapping")
+
+
 def _side_depth_usd(book: BookSnapshot, *, buy: bool) -> float:
     levels = book.asks if buy else book.bids
     return sum(level.price * level.quantity for level in levels)
@@ -76,12 +113,22 @@ def build_venue_quality(
     observed_at_ms: int,
     latency_ms: int,
     policy: VenueGatePolicy,
+    profile: EvedexProfile = EvedexProfile.DEV,
     source: str = "quant-scouts",
 ) -> VenueQualityV1:
-    """Convert one contemporaneous book pair into a strict admission fact."""
+    """Convert a captured book pair into a strict measurement without fetching sources.
 
-    if binance.source != "binance" or evedex.source != "evedex":
-        raise ValueError("venue books were supplied in the wrong order")
+    DEV remains the default. PROD is accepted only for the fixed unsuffixed
+    Binance/EVEDEX symbol pair; this calculation is not source qualification
+    or execution authority.
+    """
+
+    _validate_book_pair(
+        binance=binance,
+        evedex=evedex,
+        venue_symbol=venue_symbol,
+        profile=profile,
+    )
     if observed_at_ms <= 0:
         raise ValueError("observed_at_ms must be positive")
     observed = max(observed_at_ms, binance.timestamp_ms, evedex.timestamp_ms)
@@ -130,7 +177,7 @@ def build_venue_quality(
     blocked_slippage = policy.maximum_slippage_bps + 1.0
     return VenueQualityV1(
         source=source,
-        profile=EvedexProfile.DEV,
+        profile=profile,
         symbol=venue_symbol,
         observed_at_ms=observed,
         expires_at_ms=observed + policy.measurement_ttl_ms,

@@ -1,11 +1,17 @@
 import pytest
+from kairos_core.enums import EvedexProfile
 
 from kairos_quant.runtime_venue_gate import (
     VenueGatePolicy,
     build_venue_quality,
     evedex_dev_symbol,
 )
-from kairos_quant.venue_comparison import BookLevel, BookSnapshot
+from kairos_quant.venue_comparison import (
+    BookLevel,
+    BookSnapshot,
+    parse_binance_book,
+    parse_evedex_book,
+)
 
 
 def _book(
@@ -107,3 +113,114 @@ def test_rejects_non_usdt_binance_symbols(symbol):
 
 def test_symbol_mapping_normalizes_transport_case_and_whitespace():
     assert evedex_dev_symbol(" btcusdt ") == "BTCUSD:DEV"
+
+
+def test_default_dev_builder_preserves_legacy_non_five_symbol_pairs():
+    binance = BookSnapshot(
+        source="binance",
+        symbol="LTCUSDT",
+        timestamp_ms=1_000_000,
+        bids=(BookLevel(99.95, 20),),
+        asks=(BookLevel(100.05, 20),),
+        latency_ms=35,
+    )
+    evedex = BookSnapshot(
+        source="evedex",
+        symbol="LTCUSD:DEV",
+        timestamp_ms=1_000_000,
+        bids=(BookLevel(99.95, 20),),
+        asks=(BookLevel(100.05, 20),),
+        latency_ms=45,
+    )
+
+    quality = build_venue_quality(
+        binance=binance,
+        evedex=evedex,
+        venue_symbol="LTCUSD:DEV",
+        observed_at_ms=1_001_000,
+        latency_ms=45,
+        policy=VenueGatePolicy(),
+    )
+
+    assert quality.profile is EvedexProfile.DEV
+    assert quality.symbol == "LTCUSD:DEV"
+
+
+def _captured_prod_books():
+    """Normalize already-captured response bodies without opening a session."""
+    binance = parse_binance_book(
+        "BTCUSDT",
+        {"T": 1_000_000, "bids": [["99.95", "20"]], "asks": [["100.05", "20"]]},
+        latency_ms=35,
+    )
+    evedex = parse_evedex_book(
+        "BTCUSD",
+        {
+            "t": 1_000_000,
+            "bids": [{"price": "99.95", "quantity": "20"}],
+            "asks": [{"price": "100.05", "quantity": "20"}],
+        },
+        latency_ms=45,
+    )
+    return binance, evedex
+
+
+def test_builds_prod_measurement_from_actual_normalized_captured_books_without_network():
+    binance, evedex = _captured_prod_books()
+
+    quality = build_venue_quality(
+        binance=binance,
+        evedex=evedex,
+        venue_symbol="BTCUSD",
+        observed_at_ms=1_001_000,
+        latency_ms=45,
+        policy=VenueGatePolicy(),
+        profile=EvedexProfile.PROD,
+    )
+
+    assert quality.profile is EvedexProfile.PROD
+    assert quality.symbol == "BTCUSD"
+    assert not quality.symbol.endswith(":DEV")
+    assert quality.entry_allowed
+    assert quality.basis_bps == pytest.approx(0)
+
+
+@pytest.mark.parametrize(
+    ("binance_symbol", "evedex_symbol", "venue_symbol", "profile"),
+    [
+        ("BTCUSDT", "BTCUSD:DEV", "BTCUSD:DEV", EvedexProfile.PROD),
+        ("BTCUSDT", "BTCUSD", "BTCUSD:DEV", EvedexProfile.PROD),
+        ("ETHUSDT", "BTCUSD", "BTCUSD", EvedexProfile.PROD),
+        ("BTCUSDT", "BTCUSD", "ETHUSD", EvedexProfile.PROD),
+        ("BTCUSDT", "BTCUSD:DEV", "BTCUSD:DEV", "PROD"),
+        ("BTCUSDT", "BTCUSD", "BTCUSD", EvedexProfile.DEMO),
+    ],
+)
+def test_rejects_dev_books_or_mismatched_pair_for_prod(binance_symbol, evedex_symbol, venue_symbol, profile):
+    binance = BookSnapshot(
+        source="binance",
+        symbol=binance_symbol,
+        timestamp_ms=1_000_000,
+        bids=(BookLevel(99.95, 20),),
+        asks=(BookLevel(100.05, 20),),
+        latency_ms=35,
+    )
+    evedex = BookSnapshot(
+        source="evedex",
+        symbol=evedex_symbol,
+        timestamp_ms=1_000_000,
+        bids=(BookLevel(99.95, 20),),
+        asks=(BookLevel(100.05, 20),),
+        latency_ms=45,
+    )
+
+    with pytest.raises(ValueError):
+        build_venue_quality(
+            binance=binance,
+            evedex=evedex,
+            venue_symbol=venue_symbol,
+            observed_at_ms=1_001_000,
+            latency_ms=45,
+            policy=VenueGatePolicy(),
+            profile=profile,
+        )
