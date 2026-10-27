@@ -141,6 +141,52 @@ def test_cumulative_byte_budget_is_checked_before_sink_and_latches() -> None:
     assert len(sink.records) == 1
 
 
+def test_deferred_websocket_source_is_bounded_and_idempotently_flushed() -> None:
+    sink = MemoryCreateOnlySink()
+    capture = NativeQuantCapture(sink, capture_epoch="f" * 32, maximum_records=2)
+    source_id = capture.capture_source(
+        kind="BINANCE_WS_FRAME",
+        url="wss://fstream.binance.com/public/stream?streams=btcusdt@depth10@100ms",
+        raw_body=b'{"raw":"frame"}',
+        received_at_ms=100,
+        route="public",
+        stream_epoch="1" * 32,
+        defer_persist=True,
+    )
+    assert capture.records_written == 0
+    assert capture.pending_records == 1
+    assert capture.bytes_written == 0
+    capture.flush_sources((source_id,))
+    assert capture.records_written == 1
+    assert capture.pending_records == 0
+    persisted_count = len(sink.records)
+    capture.flush_sources((source_id,))
+    assert len(sink.records) == persisted_count
+
+    bounded = NativeQuantCapture(MemoryCreateOnlySink(), maximum_records=1)
+    bounded.capture_source(
+        kind="BINANCE_WS_FRAME",
+        url="wss://fstream.binance.com/public/stream?streams=btcusdt@depth10@100ms",
+        raw_body=b"frame-1",
+        received_at_ms=100,
+        route="public",
+        stream_epoch="1" * 32,
+        defer_persist=True,
+    )
+    with pytest.raises(NativeQuantSourceCaptureFailure, match="record budget"):
+        bounded.capture_source(
+            kind="BINANCE_WS_FRAME",
+            url="wss://fstream.binance.com/public/stream?streams=btcusdt@depth10@100ms",
+            raw_body=b"frame-2",
+            received_at_ms=101,
+            route="public",
+            stream_epoch="1" * 32,
+            defer_persist=True,
+        )
+    with pytest.raises(NativeQuantSourceCaptureFailure, match="latched"):
+        bounded.flush_sources(())
+
+
 def test_replay_requires_two_distinct_original_rest_confirmations() -> None:
     sink = MemoryCreateOnlySink()
     capture = NativeQuantCapture(sink, capture_epoch="b" * 32)
@@ -526,6 +572,83 @@ async def test_native_capture_sink_failure_prevents_bar_publication() -> None:
         await service._emit_once()
     assert bus.published == 0
     assert service.collector.pending_closed_klines("btcusdt") == (candle,)
+
+
+@pytest.mark.asyncio
+async def test_websocket_flush_failure_prevents_snapshot_publication() -> None:
+    class FailOnWebSocketSink:
+        def __init__(self) -> None:
+            self.records: dict[str, bytes] = {}
+
+        def create_only(self, observation_id: str, record: bytes) -> None:
+            decoded = json.loads(record)
+            if decoded.get("kind") == "BINANCE_WS_FRAME":
+                raise OSError("selected WS parent fsync failed")
+            self.records[observation_id] = record
+
+    sink = FailOnWebSocketSink()
+    capture = NativeQuantCapture(sink)
+    service = QuantScoutsService(QuantSettings(bus_backend="memory"), native_capture=capture)
+    symbol = service.settings.symbols[0].upper()
+    key = symbol.lower()
+    collector = service.collector
+    collector.is_kline_stream_safe = lambda *_args: True  # type: ignore[method-assign]
+    collector.is_book_fresh = lambda *_args: True  # type: ignore[method-assign]
+    collector.is_kline_fresh = lambda *_args: True  # type: ignore[method-assign]
+    collector.is_funding_fresh = lambda *_args: True  # type: ignore[method-assign]
+    collector.is_open_interest_fresh = lambda *_args: True  # type: ignore[method-assign]
+    collector.books[key] = {"bids": [(100.0, 2.0)], "asks": [(101.0, 2.0)]}
+    collector.funding[key] = 0.0001
+    collector.open_interest[key] = 1_000.0
+    collector.oi_change_pct_1h[key] = 1.0
+    collector.volume_usd[key] = 100.0
+    service.builder.push_candle(symbol, high=101, low=99, close=100)
+    service._native_bar_history[symbol] = ["f" * 32]
+
+    depth_id = capture.capture_source(
+        kind="BINANCE_WS_FRAME",
+        url=f"wss://fstream.binance.com/public/stream?streams={key}@depth10@100ms",
+        raw_body=b"depth",
+        received_at_ms=1_000,
+        route="public",
+        stream_epoch="1" * 32,
+        defer_persist=True,
+    )
+    funding_id = capture.capture_source(
+        kind="BINANCE_WS_FRAME",
+        url=f"wss://fstream.binance.com/market/stream?streams={key}@markPrice@1s",
+        raw_body=b"funding",
+        received_at_ms=1_000,
+        route="market",
+        stream_epoch="2" * 32,
+        defer_persist=True,
+    )
+    oi_id = capture.capture_source(
+        kind="BINANCE_OPEN_INTEREST_REST",
+        url="https://fapi.binance.com/futures/data/openInterestHist",
+        query_json=f'{{"limit":"13","period":"5m","symbol":"{symbol}"}}',
+        raw_body=b"[]",
+        requested_at_ms=900,
+        received_at_ms=1_000,
+        status=200,
+    )
+    collector._native_latest_sources[key] = {
+        "depth": depth_id,
+        "funding": funding_id,
+        "open_interest": oi_id,
+    }
+
+    class CountingBus:
+        published = 0
+
+        async def publish(self, topic: str, event: object) -> None:
+            self.published += 1
+
+    bus = CountingBus()
+    service.bus = bus  # type: ignore[assignment]
+    with pytest.raises(NativeQuantSourceCaptureFailure):
+        await service._emit_once()
+    assert bus.published == 0
 
 
 @pytest.mark.asyncio

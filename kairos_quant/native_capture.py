@@ -14,7 +14,7 @@ import json
 import re
 import threading
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any, Literal, NoReturn, Protocol
 from urllib.parse import parse_qs, urlsplit
 
@@ -73,17 +73,29 @@ class NativeQuantCapture:
         self._maximum_bytes = maximum_bytes
         self._sequence = 0
         self._records = 0
+        self._records_written = 0
         self._bytes_written = 0
+        self._bytes_reserved = 0
+        self._pending_sources: dict[str, bytes] = {}
+        self._persisted_ids: set[str] = set()
         self._failed = False
         self._lock = threading.Lock()
 
     @property
     def records_written(self) -> int:
-        return self._records
+        return self._records_written
 
     @property
     def bytes_written(self) -> int:
         return self._bytes_written
+
+    @property
+    def pending_records(self) -> int:
+        return len(self._pending_sources)
+
+    @property
+    def pending_bytes(self) -> int:
+        return sum(len(record) for record in self._pending_sources.values())
 
     def capture_source(
         self,
@@ -97,6 +109,7 @@ class NativeQuantCapture:
         requested_at_ms: int | None = None,
         query_json: str | None = None,
         status: int | None = None,
+        defer_persist: bool = False,
     ) -> str:
         """Persist exact REST entity or UTF-8 WebSocket text before parsing it."""
         self._ensure_healthy()
@@ -118,6 +131,8 @@ class NativeQuantCapture:
         ):
             self._fail("native source capture arguments are invalid or over bound")
         is_websocket = kind == "BINANCE_WS_FRAME"
+        if type(defer_persist) is not bool or (defer_persist and not is_websocket):
+            self._fail("deferred source persistence is allowed only for WebSocket frames")
         if is_websocket:
             if (
                 route not in {"public", "market"}
@@ -171,8 +186,38 @@ class NativeQuantCapture:
             if len(encoded) > _MAX_RECORD_BYTES:
                 self._fail("native raw source record exceeds its fixed bound")
             observation_id = hashlib.sha256(_RAW_DOMAIN + encoded).hexdigest()[:32]
-            self._persist(observation_id, encoded)
+            self._reserve(encoded)
+            if defer_persist:
+                self._pending_sources[observation_id] = encoded
+            else:
+                self._persist(observation_id, encoded, reserved=True)
             return observation_id
+
+    def flush_sources(self, observation_ids: Iterable[str]) -> None:
+        """Create-only persist selected staged inputs before their derived output."""
+        self._ensure_healthy()
+        try:
+            ids = tuple(observation_ids)
+        except Exception as exc:
+            self._fail("selected source IDs are not iterable", exc)
+        if (
+            len(ids) > _MAX_RECORDS_PER_CAPTURE
+            or len(ids) != len(set(ids))
+            or any(
+                not isinstance(item, str) or len(item) != 32 or any(char not in _HEX32 for char in item)
+                for item in ids
+            )
+        ):
+            self._fail("selected source IDs are malformed or duplicated")
+        with self._lock:
+            for observation_id in ids:
+                if observation_id in self._persisted_ids:
+                    continue
+                encoded = self._pending_sources.get(observation_id)
+                if encoded is None:
+                    self._fail("selected source was never staged by this capture session")
+                self._persist(observation_id, encoded, reserved=True)
+                del self._pending_sources[observation_id]
 
     def capture_derived_event(
         self,
@@ -323,6 +368,14 @@ class NativeQuantCapture:
         self._sequence += 1
         return self._sequence
 
+    def _reserve(self, encoded: bytes) -> None:
+        if self._records >= self._maximum_records:
+            self._fail("native source capture record budget is exhausted")
+        if self._bytes_reserved + len(encoded) > self._maximum_bytes:
+            self._fail("native capture cumulative byte budget is exhausted")
+        self._records += 1
+        self._bytes_reserved += len(encoded)
+
     def _ensure_healthy(self) -> None:
         if self._failed:
             raise NativeQuantSourceCaptureFailure("native capture is latched after an earlier failure")
@@ -412,19 +465,18 @@ class NativeQuantCapture:
                 "REST request parameters do not match the fixed native source"
             )
 
-    def _persist(self, observation_id: str, encoded: bytes) -> None:
-        if self._records >= self._maximum_records:
-            self._fail("native source capture record budget is exhausted")
-        if self._bytes_written + len(encoded) > self._maximum_bytes:
-            self._fail("native capture cumulative byte budget is exhausted")
+    def _persist(self, observation_id: str, encoded: bytes, *, reserved: bool = False) -> None:
+        if not reserved:
+            self._reserve(encoded)
         try:
             result = self._sink.create_only(observation_id, encoded)
         except Exception as exc:
             self._fail("native create-only source persistence failed", exc)
         if result is not None:
             self._fail("native source sink must synchronously return None")
-        self._records += 1
+        self._records_written += 1
         self._bytes_written += len(encoded)
+        self._persisted_ids.add(observation_id)
 
 
 __all__ = [

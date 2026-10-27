@@ -298,6 +298,8 @@ class QuantScoutsService:
                     history = self._native_bar_history[symbol]
                     history.append(bar_capture_id)
                 self._last_kline_close_time_ms[key] = kline.close_time_ms
+                if self.native_capture is not None:
+                    await asyncio.sleep(0)
 
             book = self.collector.books.get(key, {"bids": [], "asks": []})
             if (
@@ -314,19 +316,8 @@ class QuantScoutsService:
                 log.warning("snapshot.skipped_stale", symbol=symbol)
                 continue
 
-            liquidations = self.collector.liquidation_totals(key)
-            snapshot = self.builder.build(
-                symbol,
-                bids=book["bids"],
-                asks=book["asks"],
-                funding_rate=self.collector.funding.get(key, 0.0),
-                open_interest=self.collector.open_interest.get(key, 0.0),
-                oi_change_pct_1h=self.collector.oi_change_pct_1h.get(key, 0.0),
-                long_liq_usd=liquidations.long_usd,
-                short_liq_usd=liquidations.short_usd,
-                volume_usd=self.collector.volume_usd.get(key, 0.0),
-            )
             native_force_ids: tuple[str, ...] = ()
+            native_parents: dict[str, str | tuple[str, ...]] | None = None
             if self.native_capture is not None:
                 source_depth = self.collector.native_source_id(key, "depth")
                 source_funding = self.collector.native_source_id(key, "funding")
@@ -341,17 +332,36 @@ class QuantScoutsService:
                     or not self._native_history_complete[symbol]
                 ):
                     raise PermissionError("native Quant snapshot is missing one or more exact source parents")
-                parents: dict[str, str | tuple[str, ...]] = {
+                native_parents = {
                     "depth_frame": source_depth,
                     "funding_source": source_funding,
                     "open_interest_source": source_oi,
                     "force_order_frames": native_force_ids,
                     "confirmed_bars": confirmed_bars,
                 }
+                self.native_capture.flush_sources(
+                    (source_depth, source_funding, source_oi, *native_force_ids)
+                )
+
+            liquidations = self.collector.liquidation_totals(key)
+            snapshot = self.builder.build(
+                symbol,
+                bids=book["bids"],
+                asks=book["asks"],
+                funding_rate=self.collector.funding.get(key, 0.0),
+                open_interest=self.collector.open_interest.get(key, 0.0),
+                oi_change_pct_1h=self.collector.oi_change_pct_1h.get(key, 0.0),
+                long_liq_usd=liquidations.long_usd,
+                short_liq_usd=liquidations.short_usd,
+                volume_usd=self.collector.volume_usd.get(key, 0.0),
+            )
+            if self.native_capture is not None:
+                if native_parents is None:
+                    raise PermissionError("native Quant snapshot parents were not flushed")
                 self.native_capture.capture_derived_event(
                     event_kind="MARKET_SNAPSHOT",
                     event=snapshot,
-                    parents=parents,
+                    parents=native_parents,
                     replay_profile=self._native_replay_profile(),
                 )
             await self.bus.publish(Topics.MARKET_SNAPSHOT, snapshot)

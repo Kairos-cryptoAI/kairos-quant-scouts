@@ -202,8 +202,12 @@ synchronous create-only sink adapter. The default constructor remains unchanged
 and writes no capture records. Capture mode is restricted to the fixed public
 Binance USD-M origins, verified TLS, no redirects, no credentials/cookies/proxy
 defaults, and bounded source bodies. It records exact REST response entities and
-original WebSocket text before parsing. Sink or source-bound failures propagate
-and prevent the corresponding new derived event from being published.
+stages exact WebSocket text before parsing in a bounded in-memory queue. REST
+responses are create-only persisted before parsing; selected WebSocket parents
+are create-only persisted before the snapshot is built or published. Unselected
+staged frames are not written or claimed as a complete feed tape. Sink or
+source-bound failures propagate and prevent the corresponding derived event
+from being published.
 
 Raw records use `kairos.quant-source-capture.v1`; derived closed-bar and market
 snapshot records use `kairos.quant-derived-market-event.v1`. Raw records identify

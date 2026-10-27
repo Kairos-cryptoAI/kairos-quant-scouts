@@ -234,6 +234,7 @@ class BinanceFuturesCollector:
                                                 received_at_ms=received_at_ms,
                                                 route=route,
                                                 stream_epoch=stream_epoch,
+                                                defer_persist=True,
                                             )
                                         payload = (
                                             json.loads(
