@@ -516,8 +516,14 @@ def _replay_market_snapshot(
         collector._integer(item.get("timestamp")) for item in oi_payload[-13:] if isinstance(item, dict)
     ]
     valid_oi_stamps = [stamp for stamp in oi_stamps if stamp is not None]
-    if not valid_oi_stamps or output_ms - valid_oi_stamps[-1] > profile["derivatives_stale_after_ms"]:
-        raise NativeQuantSourceCaptureFailure("market snapshot OI source is stale at output time")
+    oi_received_ms = oi_record.get("received_at_ms")
+    if not valid_oi_stamps or type(oi_received_ms) is not int:
+        raise NativeQuantSourceCaptureFailure("market snapshot OI source receipt is missing")
+    # The collector applies the 600-second exchange-data age limit when it
+    # accepts the response, then its freshness TTL is based on local receipt
+    # time. Do not compare an older exchange sample timestamp to that TTL.
+    if output_ms - oi_received_ms > profile["derivatives_stale_after_ms"]:
+        raise NativeQuantSourceCaptureFailure("market snapshot OI response is stale at output time")
     builder = SnapshotBuilder(
         str(event_payload.get("source", "kairos-quant-scouts")),
         window=profile["price_window"],

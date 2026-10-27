@@ -348,7 +348,7 @@ def test_market_snapshot_replays_through_existing_collector_and_builder() -> Non
         [
             {
                 "symbol": "BTCUSDT",
-                "timestamp": now_ms - 3_720_000 + index * 300_000,
+                "timestamp": now_ms - 3_850_000 + index * 300_000,
                 "sumOpenInterestValue": str(1000 + index),
             }
             for index in range(13)
@@ -360,8 +360,8 @@ def test_market_snapshot_replays_through_existing_collector_and_builder() -> Non
         url="https://fapi.binance.com/futures/data/openInterestHist",
         query_json='{"limit":"13","period":"5m","symbol":"BTCUSDT"}',
         raw_body=oi_body,
-        requested_at_ms=now_ms - 110_000,
-        received_at_ms=now_ms - 100_000,
+        requested_at_ms=now_ms - 10_000,
+        received_at_ms=now_ms - 1_000,
         status=200,
     )
 
@@ -371,7 +371,9 @@ def test_market_snapshot_replays_through_existing_collector_and_builder() -> Non
     assert collector._on_message(depth_message, route="public")
     assert collector._on_message(mark_message, route="market")
     # Match the production OI input projection for this captured 13-point series.
-    observations = [(now_ms - 3_720_000 + index * 300_000, 1000 + index) for index in range(13)]
+    # The newest exchange sample is 250 seconds old but was fetched just now;
+    # Quant's source-age allowance is 600 seconds and local freshness is recent.
+    observations = [(now_ms - 3_850_000 + index * 300_000, 1000 + index) for index in range(13)]
     collector.open_interest["btcusdt"] = float(observations[-1][1])
     collector.oi_change_pct_1h["btcusdt"] = (
         100.0 * (observations[-1][1] - observations[0][1]) / observations[0][1]
@@ -410,6 +412,37 @@ def test_market_snapshot_replays_through_existing_collector_and_builder() -> Non
     )
     assert replayed["symbol"] == expected.symbol
     assert replayed["order_book"] == expected.order_book.model_dump(mode="json")
+
+    stale_source_body = json.dumps(
+        [
+            {
+                "symbol": "BTCUSDT",
+                "timestamp": now_ms - 4_400_000 + index * 300_000,
+                "sumOpenInterestValue": str(1000 + index),
+            }
+            for index in range(13)
+        ],
+        separators=(",", ":"),
+    ).encode()
+    stale_source_id = capture.capture_source(
+        kind="BINANCE_OPEN_INTEREST_REST",
+        url="https://fapi.binance.com/futures/data/openInterestHist",
+        query_json='{"limit":"13","period":"5m","symbol":"BTCUSDT"}',
+        raw_body=stale_source_body,
+        requested_at_ms=now_ms - 10_000,
+        received_at_ms=now_ms - 1_000,
+        status=200,
+    )
+    stale_source_output = json.loads(records[output_id])
+    stale_source_output["parents"]["open_interest_source"] = stale_source_id
+    records[stale_source_id] = sink.records[stale_source_id]
+    with pytest.raises(NativeQuantSourceCaptureFailure, match="stale"):
+        replay_native_quant_event(
+            event_kind="MARKET_SNAPSHOT",
+            expected_payload=expected.model_dump(mode="json"),
+            source_records=records,
+            output_record=stale_source_output,
+        )
 
     incomplete = dict(records)
     incomplete.pop(first_bar_source)
