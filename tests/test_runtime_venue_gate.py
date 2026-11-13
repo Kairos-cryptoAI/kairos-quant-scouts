@@ -2,6 +2,7 @@ import pytest
 from kairos_core.enums import EvedexProfile
 
 from kairos_quant.runtime_venue_gate import (
+    PROD_SYMBOL_MAP,
     VenueGatePolicy,
     build_venue_quality,
     evedex_dev_symbol,
@@ -223,4 +224,79 @@ def test_rejects_dev_books_or_mismatched_pair_for_prod(binance_symbol, evedex_sy
             latency_ms=45,
             policy=VenueGatePolicy(),
             profile=profile,
+        )
+
+
+def test_prod_mapping_is_closed_and_covers_the_live_runner_universe():
+    assert dict(PROD_SYMBOL_MAP) == {
+        "AAVEUSDT": "AAVEUSD",
+        "BNBUSDT": "BNBUSD",
+        "BTCUSDT": "BTCUSD",
+        "DOGEUSDT": "DOGEUSD",
+        "ETHUSDT": "ETHUSD",
+        "HYPEUSDT": "HYPEUSD",
+        "LINKUSDT": "LINKUSD",
+        "SOLUSDT": "SOLUSD",
+        "SUIUSDT": "SUIUSD",
+        "XRPUSDT": "XRPUSD",
+        "ZECUSDT": "ZECUSD",
+    }
+    with pytest.raises(TypeError):
+        PROD_SYMBOL_MAP["LTCUSDT"] = "LTCUSD"  # type: ignore[index]
+
+
+@pytest.mark.parametrize("signal_symbol", ["ZECUSDT", "HYPEUSDT"])
+def test_builds_prod_measurement_for_an_added_pair_and_refuses_an_unmapped_one(signal_symbol):
+    venue_symbol = PROD_SYMBOL_MAP[signal_symbol]
+    binance = BookSnapshot(
+        source="binance",
+        symbol=signal_symbol,
+        timestamp_ms=1_000_000,
+        bids=(BookLevel(99.95, 20),),
+        asks=(BookLevel(100.05, 20),),
+        latency_ms=35,
+    )
+    evedex = BookSnapshot(
+        source="evedex",
+        symbol=venue_symbol,
+        timestamp_ms=1_000_000,
+        bids=(BookLevel(99.95, 20),),
+        asks=(BookLevel(100.05, 20),),
+        latency_ms=45,
+    )
+    quality = build_venue_quality(
+        binance=binance,
+        evedex=evedex,
+        venue_symbol=venue_symbol,
+        observed_at_ms=1_001_000,
+        latency_ms=45,
+        policy=VenueGatePolicy(),
+        profile=EvedexProfile.PROD,
+    )
+    assert quality.symbol == venue_symbol and quality.entry_allowed
+
+    unmapped = BookSnapshot(
+        source="binance",
+        symbol="LTCUSDT",
+        timestamp_ms=1_000_000,
+        bids=(BookLevel(99.95, 20),),
+        asks=(BookLevel(100.05, 20),),
+        latency_ms=35,
+    )
+    with pytest.raises(ValueError, match="approved USDT signal symbol"):
+        build_venue_quality(
+            binance=unmapped,
+            evedex=BookSnapshot(
+                source="evedex",
+                symbol="LTCUSD",
+                timestamp_ms=1_000_000,
+                bids=(BookLevel(99.95, 20),),
+                asks=(BookLevel(100.05, 20),),
+                latency_ms=45,
+            ),
+            venue_symbol="LTCUSD",
+            observed_at_ms=1_001_000,
+            latency_ms=45,
+            policy=VenueGatePolicy(),
+            profile=EvedexProfile.PROD,
         )

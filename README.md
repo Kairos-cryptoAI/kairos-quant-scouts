@@ -154,7 +154,10 @@ process downtime and configuration changes cannot inflate venue availability.
 
 The pure `build_venue_quality` calculation also accepts an explicit
 `profile=EvedexProfile.PROD` for already-captured books, but only for the fixed
-unsuffixed Binance-to-EVEDEX symbol mapping. Its default remains DEV, and this
+unsuffixed Binance-to-EVEDEX symbol mapping `PROD_SYMBOL_MAP`: BTC, ETH, SOL, BNB and XRP,
+and since 2026-11-13 also AAVE, DOGE, HYPE, LINK, SUI and ZEC, the instruments of the live
+runner (`kairos-autotrader`). The DEV, PAPER and simulation universes are unchanged. Its
+default remains DEV, and this
 calculation does not fetch or qualify sources, convert a DEV observation into PROD,
 or grant execution authority.
 

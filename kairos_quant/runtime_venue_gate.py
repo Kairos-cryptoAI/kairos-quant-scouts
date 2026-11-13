@@ -64,6 +64,8 @@ def evedex_dev_symbol(binance_symbol: str) -> str:
     return f"{normalized[:-4]}USD:DEV"
 
 
+# The closed Binance-to-EVEDEX PROD mapping. A measurement can only be built for these
+# pairs; each one is a decision about the traded universe, not a naming convention.
 PROD_SYMBOL_MAP = MappingProxyType(
     {
         "BTCUSDT": "BTCUSD",
@@ -71,6 +73,13 @@ PROD_SYMBOL_MAP = MappingProxyType(
         "SOLUSDT": "SOLUSD",
         "BNBUSDT": "BNBUSD",
         "XRPUSDT": "XRPUSD",
+        # Added 2026-11-13 for the live runner's universe (kairos-autotrader).
+        "AAVEUSDT": "AAVEUSD",
+        "DOGEUSDT": "DOGEUSD",
+        "HYPEUSDT": "HYPEUSD",
+        "LINKUSDT": "LINKUSD",
+        "SUIUSDT": "SUIUSD",
+        "ZECUSDT": "ZECUSD",
     }
 )
 
