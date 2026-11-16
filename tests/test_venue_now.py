@@ -50,13 +50,14 @@ def test_refuses_an_unreviewed_pair_before_any_request():
     requests = []
     with pytest.raises(ValueError, match="outside the approved PROD symbol map"):
         asyncio.run(
-            measure_prod_venue("LTCUSDT", taker_fee_bps=5, assessed_notional_usd=200, fetch=_fetch(requests))
+            measure_prod_venue("ATOMUSDT", taker_fee_bps=5, assessed_notional_usd=200, fetch=_fetch(requests))
         )
     assert requests == []
 
 
 def test_command_line_failure_is_one_json_error_line(capsys):
     assert (
-        venue_now.main(["--signal", "LTCUSDT", "--taker-fee-bps", "5", "--assessed-notional-usd", "200"]) == 1
+        venue_now.main(["--signal", "ATOMUSDT", "--taker-fee-bps", "5", "--assessed-notional-usd", "200"])
+        == 1
     )
     assert "outside the approved PROD symbol map" in json.loads(capsys.readouterr().out)["error"]

@@ -240,9 +240,22 @@ def test_prod_mapping_is_closed_and_covers_the_live_runner_universe():
         "SUIUSDT": "SUIUSD",
         "XRPUSDT": "XRPUSD",
         "ZECUSDT": "ZECUSD",
+        "ENAUSDT": "ENAUSD",
+        "1000PEPEUSDT": "1000PEPEUSD",
+        "LTCUSDT": "LTCUSD",
+        "TRXUSDT": "TRXUSD",
+        "ARBUSDT": "ARBUSD",
+        "TAOUSDT": "TAOUSD",
+        "APTUSDT": "APTUSD",
+        "1000BONKUSDT": "1000BONKUSD",
+        "VIRTUALUSDT": "VIRTUALUSD",
+        "BCHUSDT": "BCHUSD",
+        "OPUSDT": "OPUSD",
+        "DOTUSDT": "DOTUSD",
+        "AVAXUSDT": "AVAXUSD",
     }
     with pytest.raises(TypeError):
-        PROD_SYMBOL_MAP["LTCUSDT"] = "LTCUSD"  # type: ignore[index]
+        PROD_SYMBOL_MAP["ATOMUSDT"] = "ATOMUSD"  # type: ignore[index]
 
 
 @pytest.mark.parametrize("signal_symbol", ["ZECUSDT", "HYPEUSDT"])
@@ -277,7 +290,7 @@ def test_builds_prod_measurement_for_an_added_pair_and_refuses_an_unmapped_one(s
 
     unmapped = BookSnapshot(
         source="binance",
-        symbol="LTCUSDT",
+        symbol="ATOMUSDT",
         timestamp_ms=1_000_000,
         bids=(BookLevel(99.95, 20),),
         asks=(BookLevel(100.05, 20),),
@@ -288,13 +301,13 @@ def test_builds_prod_measurement_for_an_added_pair_and_refuses_an_unmapped_one(s
             binance=unmapped,
             evedex=BookSnapshot(
                 source="evedex",
-                symbol="LTCUSD",
+                symbol="ATOMUSD",
                 timestamp_ms=1_000_000,
                 bids=(BookLevel(99.95, 20),),
                 asks=(BookLevel(100.05, 20),),
                 latency_ms=45,
             ),
-            venue_symbol="LTCUSD",
+            venue_symbol="ATOMUSD",
             observed_at_ms=1_001_000,
             latency_ms=45,
             policy=VenueGatePolicy(),

@@ -80,6 +80,21 @@ PROD_SYMBOL_MAP = MappingProxyType(
         "LINKUSDT": "LINKUSD",
         "SUIUSDT": "SUIUSD",
         "ZECUSDT": "ZECUSD",
+        # Added 2026-11-16 by owner decision: thirteen more pairs with a Binance USD-M
+        # contract, open EVEDEX trading, a spread of about 5 bps or less and a deep book.
+        "ENAUSDT": "ENAUSD",
+        "1000PEPEUSDT": "1000PEPEUSD",
+        "LTCUSDT": "LTCUSD",
+        "TRXUSDT": "TRXUSD",
+        "ARBUSDT": "ARBUSD",
+        "TAOUSDT": "TAOUSD",
+        "APTUSDT": "APTUSD",
+        "1000BONKUSDT": "1000BONKUSD",
+        "VIRTUALUSDT": "VIRTUALUSD",
+        "BCHUSDT": "BCHUSD",
+        "OPUSDT": "OPUSD",
+        "DOTUSDT": "DOTUSD",
+        "AVAXUSDT": "AVAXUSD",
     }
 )
 
